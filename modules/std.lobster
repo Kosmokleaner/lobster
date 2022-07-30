@@ -1,7 +1,7 @@
 // standard functions that build on top of the builtin functions useful for almost all programs
 
 def map(xs, fun):
-    let r = vector_reserve(typeof return, xs.length)
+    let r = [].vector_capacity(xs.length)
     for(xs) x, i:
         r.push(fun(x, i))
     return r
@@ -192,7 +192,7 @@ def return_after(v, f):
     f()
     return v
 
-def do(f): f()  // Useful to create a scope where there is none.
+def do(f): return f()  // Useful to create a scope where there is none.
 
 def for_bias (num, bias,  fun): for num: fun(_ + bias)
 def for_scale(num, scale, fun): for num: fun(_ * scale)

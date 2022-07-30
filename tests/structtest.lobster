@@ -94,7 +94,7 @@ run_test("struct"):
         assert mm(mm2 { 0 }, xy { 4, 5 }) == 9
 
     // Structs with reference counted members.
-    // This very preliminary: doesn't support mixed refc/scalar, needs more testing.
+    // This very preliminary: needs more testing.
     do():
         struct R:
             a:string
@@ -117,6 +117,17 @@ run_test("struct"):
         frn = fun(rns[1])
         assert frn.a == "BBBB" and frn.r.b[1] == 2
 
+    // Mixed refc & scalar:
+    do():
+        struct RS:
+            a:string
+            b:int
+        var rs = RS { "hi", 1 }
+        def frs(x): return RS { x.a + x.a, x.b + x.b }
+        rs = frs(rs)
+        assert rs.a == "hihi" and rs.b == 2
+        assert string(rs) == "RS\{\"hihi\", 2\}"
+
     // We used to only support math on structs of sizes 2..4
     do():
         struct V1:
@@ -133,7 +144,7 @@ run_test("struct"):
             v:float
         let v5test = V5 { 1.0, 2.0, 3.0, 4.0, 5.0 }
         let v5test2 = v5test + v5test
-        assert v5test2 == v5test * 2
+        assert v5test2 == v5test * 2.0
         assert magnitude(normalize(v5test2)) == 1.0
         assert min(v5test, max(v5test, v5test2)) == v5test
         assert dot(v5test, v5test2) == 110.0

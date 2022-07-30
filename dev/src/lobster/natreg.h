@@ -77,6 +77,7 @@ struct Type {
         Enum *e;                 // V_INT
         vector<TupleElem> *tup;  // V_TUPLE
         TypeVariable *tv;        // V_TYPEVAR
+        ResourceType *rt;        // V_RESOURCE
     };
 
     Type()                               :               sub(nullptr) {}
@@ -87,16 +88,30 @@ struct Type {
     Type(ValueType _t, UDT *_udt)        : t(_t),        udt(_udt)    {}
     Type(Enum *_e)                       : t(V_INT),     e(_e)        {}
     Type(TypeVariable *_tv)              : t(V_TYPEVAR), tv(_tv)      {}
+    Type(ResourceType *_rt)              : t(V_RESOURCE),rt(_rt)      {}
 
-
-    bool Equal(const Type &o) const {
+    bool Equal(const Type &o, bool allow_unresolved = false) const {
         if (this == &o) return true;
-        if (t != o.t) return false;
+        if (t != o.t) {
+            if (!allow_unresolved) return false;
+            // Special case for V_UUDT, since sometime types are resolved in odd orders.
+            // TODO: can the is_generic be removed?
+            switch (t) {
+                case V_UUDT:
+                    return IsUDT(o.t) && spec_udt->udt == o.udt && !spec_udt->is_generic;
+                case V_CLASS:
+                case V_STRUCT_R:
+                case V_STRUCT_S:
+                    return o.t == V_UUDT && o.spec_udt->udt == udt && !o.spec_udt->is_generic;
+                default:
+                    return false;
+            }
+        }
         if (sub == o.sub) return true;  // Also compares sf/udt
         switch (t) {
             case V_VECTOR:
             case V_NIL:
-                return sub->Equal(*o.sub);
+                return sub->Equal(*o.sub, allow_unresolved);
             case V_UUDT:
                 return spec_udt->Equal(*o.spec_udt);
             default:
@@ -193,7 +208,6 @@ struct UnresolvedTypeRef {
     TypeRef utr;
 };
 
-
 extern TypeRef type_int;
 extern TypeRef type_float;
 extern TypeRef type_string;
@@ -205,11 +219,33 @@ extern TypeRef type_function_cocl;
 extern TypeRef type_resource;
 extern TypeRef type_vector_resource;
 extern TypeRef type_typeid;
-extern TypeRef type_typeid_vec;
 extern TypeRef type_void;
 extern TypeRef type_undefined;
 
 TypeRef WrapKnown(TypeRef elem, ValueType with);
+
+// There must be a single of these per type, since they are compared by pointer.
+struct ResourceType {
+    string_view name;
+    ResourceType *next;
+    const Type thistype;
+    const Type thistypenil;
+    const Type thistypevec;
+
+    ResourceType(string_view n)
+        : name(n), next(nullptr), thistype(this),
+          thistypenil(V_NIL, &thistype), thistypevec(V_VECTOR, &thistype) {
+        next = g_resource_type_list;
+        g_resource_type_list = this;
+    }
+};
+
+inline ResourceType *LookupResourceType(string_view name) {
+    for (auto rt = g_resource_type_list; rt; rt = rt->next) {
+        if (rt->name == name) return rt;
+    }
+    return nullptr;
+}
 
 struct Named {
     string name;
@@ -257,7 +293,6 @@ struct Narg {
             case 'L': type = type_function_null; break;  // FIXME: only used by hash(), in gui.lobster
             case 'R': type = type_resource; break;
             case 'T': type = type_typeid; break;
-            case 'V': type = type_typeid_vec; break;
             default:  assert(0);
         }
         while (*tid && !isupper(*tid)) {
@@ -284,13 +319,22 @@ struct Narg {
                     assert(!type.Null());
                     break;
                 case ':':
-                    assert(*tid >= '/' && *tid <= '9');
-                    fixed_len = *tid++ - '0';
+                    if (type->t == V_RESOURCE) {
+                        auto nstart = tid;
+                        while (islower(*tid)) tid++;
+                        auto rt = LookupResourceType(string_view(nstart, tid - nstart));
+                        assert(rt);  // If hit, "R:name" is not a resource type.
+                        type = &rt->thistype;
+                    } else {
+                        assert(*tid >= '/' && *tid <= '9');
+                        fixed_len = *tid++ - '0';
+                    }
                     break;
                 default:
                     assert(false);
             }
         }
+        assert(type->t != V_RESOURCE || type->rt);  // All uses of type R must have :name specifier.
     }
 };
 
@@ -388,12 +432,25 @@ struct NativeRegistry {
     vector<NativeFun *> nfuns;
     unordered_map<string_view, NativeFun *> nfunlookup;  // Key points to value!
     vector<string> subsystems;
+    #if LOBSTER_FRAME_PROFILER_BUILTINS
+        vector<tracy::SourceLocationData> pre_allocated_function_locations;
+    #endif
 
     ~NativeRegistry() {
         for (auto f : nfuns) delete f;
     }
 
     void NativeSubSystemStart(const char *name) { subsystems.push_back(name); }
+
+    void DoneRegistering() {
+        #if LOBSTER_FRAME_PROFILER_BUILTINS
+            for (size_t i = 0; i < nfuns.size(); i++) {
+                auto f = nfuns[i];
+                pre_allocated_function_locations.push_back(
+                    tracy::SourceLocationData { f->name.c_str(), f->name.c_str(), "", 0, 0x880088 });
+            }
+        #endif
+    }
 
     #define REGISTER(N) \
     void operator()(const char *name, const char *ids, const char *typeids, \

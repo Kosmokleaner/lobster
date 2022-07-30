@@ -3,6 +3,8 @@
 #include "lobster/natreg.h"
 #include "lobster/bytecode_generated.h"
 
+extern void BreakPoint(lobster::VM &vm, string_view reason);
+
 namespace lobster {
 
 #define VM_OP_ARGS0
@@ -165,7 +167,7 @@ VM_INLINE void U_CALLV(VM &vm, StackPtr sp) {
 VM_INLINE void U_DDCALL(VM &vm, StackPtr sp, int vtable_idx, int stack_idx) {
     auto self = TopM(sp, stack_idx);
     VMTYPEEQ(self, V_CLASS);
-    auto start = self.oval()->ti(vm).vtable_start;
+    auto start = self.oval()->ti(vm).vtable_start_or_bitmask;
     vm.next_call_target = vm.native_vtables[start + vtable_idx];
     assert(vm.next_call_target);
 }
@@ -173,22 +175,30 @@ VM_INLINE void U_DDCALL(VM &vm, StackPtr sp, int vtable_idx, int stack_idx) {
 VM_INLINE void U_FUNSTART(VM &, StackPtr, const int *) {
 }
 
-VM_INLINE void U_RETURN(VM &vm, StackPtr, int df, int /*nrv*/) {
-    vm.ret_unwind_to = df;  // FIXME: most returns don't need this.
+VM_INLINE void U_RETURNLOCAL(VM &vm, StackPtr, int /*nrv*/) {
+    #ifndef NDEBUG
+        vm.ret_unwind_to = -9;
+        vm.ret_slots = -9;
+    #else
+        (void)vm;
+    #endif
 }
 
-VM_INLINE void U_RETURNANY(VM &, StackPtr, int /*nretslots_unwind*/, int /*nretslots_norm*/) {
+VM_INLINE void U_RETURNNONLOCAL(VM &vm, StackPtr, int nrv, int df) {
+    vm.ret_unwind_to = df;
+    vm.ret_slots = nrv;
+}
+
+VM_INLINE void U_RETURNANY(VM &, StackPtr, int /*nretslots_norm*/) {
 }
 
 VM_INLINE void U_SAVERETS(VM &, StackPtr) {
 }
 
-VM_INLINE void U_ENDSTATEMENT(VM &vm, StackPtr, int line, int fileidx) {
-    #ifdef NDEBUG
-        (void)line;
-        (void)fileidx;
-        (void)vm;
-    #else
+VM_INLINE void U_STATEMENT(VM &vm, StackPtr, int line, int fileidx) {
+    vm.last_line = line;
+    vm.last_fileidx = fileidx;
+    #ifndef NDEBUG
         if (vm.trace != TraceMode::OFF) {
             auto &sd = vm.TraceStream();
             append(sd, vm.bcf->filenames()->Get(fileidx)->string_view(), "(", line, ")");
@@ -222,12 +232,24 @@ VM_INLINE bool U_IFOR(VM &vm, StackPtr sp) { return ForLoop(vm, sp, Top(sp).ival
 VM_INLINE bool U_VFOR(VM &vm, StackPtr sp) { return ForLoop(vm, sp, Top(sp).vval()->len); }
 VM_INLINE bool U_SFOR(VM &vm, StackPtr sp) { return ForLoop(vm, sp, Top(sp).sval()->len); }
 
-VM_INLINE void U_IFORELEM(VM &, StackPtr sp)      { FORELEM(iter.ival()); (void)iter; Push(sp, i); }
-VM_INLINE void U_SFORELEM(VM &, StackPtr sp)      { FORELEM(iter.sval()->len); Push(sp, Value(((uint8_t *)iter.sval()->data())[i])); }
-VM_INLINE void U_VFORELEM(VM &, StackPtr sp)      { FORELEM(iter.vval()->len); Push(sp, iter.vval()->At(i)); }
-VM_INLINE void U_VFORELEM2S(VM &, StackPtr sp)    { FORELEM(iter.vval()->len); iter.vval()->AtVW(sp, i); }
-VM_INLINE void U_VFORELEMREF(VM &, StackPtr sp)   { FORELEM(iter.vval()->len); auto el = iter.vval()->At(i); el.LTINCRTNIL(); Push(sp, el); }
-VM_INLINE void U_VFORELEMREF2S(VM &, StackPtr sp) { FORELEM(iter.vval()->len); iter.vval()->AtVWInc(sp, i); }
+VM_INLINE void U_IFORELEM(VM &, StackPtr sp) {
+    FORELEM(iter.ival()); (void)iter; Push(sp, i);
+}
+VM_INLINE void U_SFORELEM(VM &, StackPtr sp) {
+    FORELEM(iter.sval()->len); Push(sp, Value(((uint8_t *)iter.sval()->data())[i]));
+}
+VM_INLINE void U_VFORELEM(VM &, StackPtr sp) {
+    FORELEM(iter.vval()->len); Push(sp, iter.vval()->At(i));
+}
+VM_INLINE void U_VFORELEM2S(VM &, StackPtr sp) {
+    FORELEM(iter.vval()->len); iter.vval()->AtVW(sp, i);
+}
+VM_INLINE void U_VFORELEMREF(VM &, StackPtr sp) {
+    FORELEM(iter.vval()->len); auto el = iter.vval()->At(i); el.LTINCRTNIL(); Push(sp, el);
+}
+VM_INLINE void U_VFORELEMREF2S(VM &, StackPtr sp, int bitmask) {
+    FORELEM(iter.vval()->len); iter.vval()->AtVWInc(sp, i, bitmask);
+}
 
 VM_INLINE void U_FORLOOPI(VM &, StackPtr sp) {
     auto &i = TopM(sp, 1);  // This relies on for being inlined, otherwise it would be 2.
@@ -235,14 +257,22 @@ VM_INLINE void U_FORLOOPI(VM &, StackPtr sp) {
     Push(sp, i);
 }
 
+#if LOBSTER_FRAME_PROFILER_BUILTINS
+    #define BPROF(NFI) tracy::ScopedZone ___tracy_scoped_zone(&vm.nfr.pre_allocated_function_locations[NFI])
+#else
+    #define BPROF(NFI)
+#endif
+
 VM_INLINE void U_BCALLRETV(VM &vm, StackPtr sp, int nfi, int /*has_ret*/) {
     auto nf = vm.nfr.nfuns[nfi];
+    BPROF(nfi);
     nf->fun.fV(sp, vm);
 }
 
 #define BCALLOP(N,DECLS,ARGS) \
 VM_INLINE void U_BCALLRET##N(VM &vm, StackPtr sp, int nfi, int has_ret) { \
     auto nf = vm.nfr.nfuns[nfi]; \
+    BPROF(nfi); \
     DECLS; \
     Value v = nf->fun.f##N ARGS; \
     if (has_ret) { Push(sp, v); vm.BCallRetCheck(sp, nf); } \
@@ -261,11 +291,16 @@ VM_INLINE void U_ASSERTR(VM &vm, StackPtr sp, int line, int fileidx, int stringi
     (void)line;
     (void)fileidx;
     if (Top(sp).False()) {
-        vm.Error(cat(
-            #if !VM_JIT_MODE
-                vm.bcf->filenames()->Get(fileidx)->string_view(), "(", line, "): ",
-            #endif
-            "assertion failed: ", vm.bcf->stringtable()->Get(stringidx)->string_view()));
+        vm.last_line = line;
+        vm.last_fileidx = fileidx;
+        auto assert_exp = vm.bcf->stringtable()->Get(stringidx)->string_view();
+        #if LOBSTER_ENGINE
+            if (vm.runtime_checks >= RUNTIME_DEBUG) {
+                auto msg = cat("Assertion hit: ", assert_exp);
+                BreakPoint(vm, msg);
+            }
+        #endif
+        vm.Error(cat("assertion failed: ", assert_exp));
     }
 }
 
@@ -293,9 +328,7 @@ VM_INLINE void U_NEWOBJECT(VM &vm, StackPtr sp, int ty) {
 
 VM_INLINE void U_POP(VM &, StackPtr sp) { Pop(sp); }
 VM_INLINE void U_POPREF(VM &vm, StackPtr sp) { auto x = Pop(sp); x.LTDECRTNIL(vm); }
-
 VM_INLINE void U_POPV(VM &, StackPtr sp, int len) { PopN(sp, len); }
-VM_INLINE void U_POPVREF(VM &vm, StackPtr sp, int len) { while (len--) Pop(sp).LTDECRTNIL(vm); }
 
 VM_INLINE void U_DUP(VM &, StackPtr sp) { auto x = Top(sp); Push(sp, x); }
 
@@ -553,8 +586,9 @@ VM_INLINE void U_E2B(VM &, StackPtr sp) {
     Push(sp, a.True());
 }
 
-VM_INLINE void U_E2BREF(VM &, StackPtr sp) {
+VM_INLINE void U_E2BREF(VM &vm, StackPtr sp) {
     Value a = Pop(sp);
+    a.LTDECRTNIL(vm);
     Push(sp, a.True());
 }
 
@@ -685,6 +719,7 @@ VM_INLINE bool U_JUMPNOFAILR(VM &, StackPtr sp) {
 }
 
 VM_INLINE bool U_JUMPIFUNWOUND(VM &vm, StackPtr, int df) {
+    assert(vm.ret_unwind_to >= 0);
     return vm.ret_unwind_to != df;
 }
 
@@ -831,9 +866,12 @@ VM_INLINE void U_LV_WRITEV(VM &vm, StackPtr sp, int l) {
     PopN(sp, l);
 }
 
-VM_INLINE void U_LV_WRITEREFV(VM &vm, StackPtr sp, int l) {
+VM_INLINE void U_LV_WRITEREFV(VM &vm, StackPtr sp, int l, int bitmask) {
+    // TODO: if this bitmask checking is expensive, either make a version of
+    // this op for structs with all ref elems, or better yet, special case for
+    // structs with a single elem.
     auto &a = *vm.temp_lval;
-    for (int i = 0; i < l; i++) (&a)[i].LTDECRTNIL(vm);
+    for (int i = 0; i < l; i++) if ((1 << i) & bitmask) (&a)[i].LTDECRTNIL(vm);
     auto b = TopPtr(sp) - l;
     tsnz_memcpy(&a, b, l);
     PopN(sp, l);
@@ -857,6 +895,10 @@ VM_INLINE void U_LV_FPP(VM & vm, StackPtr) {
 VM_INLINE void U_LV_FMM(VM & vm, StackPtr) {
     auto &a = *vm.temp_lval;
     a.setfval(a.fval() - 1);
+}
+
+VM_INLINE void U_PROFILE(VM &, StackPtr, int) {
+    assert(false);
 }
 
 }  // namespace lobster

@@ -77,6 +77,7 @@ struct TypeChecker {
     vector<Scope> scopes, named_scopes;
     vector<FlowItem> flowstack;
     vector<Borrow> borrowstack;
+    set<pair<Line, int64_t>> integer_literal_warnings;
 
     TypeChecker(Parser &_p, SymbolTable &_st, size_t retreq) : parser(_p), st(_st) {
         // FIXME: this is unfriendly.
@@ -107,10 +108,11 @@ struct TypeChecker {
     void UpdateCurrentSid(SpecIdent *&sid) { sid = sid->Current(); }
     void RevertCurrentSid(SpecIdent *&sid) { sid->Current() = sid; }
 
-    void PromoteStructIdx(TypeRef &type, const UDT *olds, const UDT &news) {
-        auto u = type;
+    void PromoteStructIdx(Field &field, const UDT *olds, const UDT &news) {
+        auto u = field.resolvedtype();
         while (u->Wrapped()) u = u->Element();
-        if (IsUDT(u->t) && u->udt == olds) type = PromoteStructIdxRec(type, news);
+        if (IsUDT(u->t) && u->udt == olds)
+            field.set_resolvedtype(PromoteStructIdxRec(field.resolvedtype(), news));
     }
 
     TypeRef PromoteStructIdxRec(TypeRef type, const UDT &news) {
@@ -162,6 +164,7 @@ struct TypeChecker {
                 err += SignatureWithFreeVars(*scope.sf, &already_seen);
                 for (auto dl : scope.sf->sbody->children) {
                     if (auto def = Is<Define>(dl)) {
+                        if (Is<DefaultVal>(def->child)) continue;  // A pre-decl.
                         for (auto p : def->sids) {
                             err += ", " + p.first->id->name + ":" + TypeName(p.first->type);
                         }
@@ -287,12 +290,6 @@ struct TypeChecker {
                 if (type->t != V_TYPEID) return false;
                 bound = bound->sub;
                 type = type->sub;
-                // FIXME: should bind to vector of var? See typeof return in map.
-                if (type->t == V_VAR) return true;
-                if (bound->t == V_VECTOR && type->t == V_VECTOR) {
-                    bound = bound->sub;
-                    type = type->sub;
-                }
                 // This is minimalistic, but suffices for the current uses of V_TYPEID.
                 return bound->t == V_ANY;
             default:
@@ -390,6 +387,13 @@ struct TypeChecker {
         switch (bound->t) {
             case V_FLOAT:
                 if (a->exptype->t == V_INT) {
+                    if (auto ic = Is<IntConstant>(a)) {
+                        auto this_warn = make_pair(ic->line, ic->integer);
+                        if (integer_literal_warnings.insert(this_warn).second) {
+                            parser.WarnAt(a, "integer literal (", ic->integer,
+                                          ") where float expected");
+                        }
+                    }
                     MakeFloat(a);
                     return;
                 }
@@ -632,7 +636,8 @@ struct TypeChecker {
         if (!u->Numeric() && u->t != V_STRING) {
             if (Is<Equal>(&n) || Is<NotEqual>(&n)) {
                 // Comparison with one result, but still by value for structs.
-                if (u->t != V_VECTOR && !IsUDT(u->t) && u->t != V_NIL && u->t != V_FUNCTION)
+                if (u->t != V_VECTOR && !IsUDT(u->t) && u->t != V_NIL &&
+                    u->t != V_FUNCTION && u->t != V_RESOURCE)
                     RequiresError(TypeName(n.left->exptype), n.right->exptype, n,
                                   "right-hand side");
                 if (u->t == V_STRUCT_S && !u->udt->sametype->Numeric())
@@ -687,11 +692,13 @@ struct TypeChecker {
         return _scopes.empty() ? nullptr : _scopes.back().sf;
     }
 
-    void TypeCheckUDT(UDT &udt, const Node &errn) {
+    void TypeCheckUDT(UDT &udt, const Node &errn, bool predeclaration) {
+        //if (predeclaration) return;
+        LOG_DEBUG("TypeCheckUDT: ", udt.name);
         if (udt.FullyBound()) {
             // Give a type for fields that don't have one specified.
             for (auto &f : udt.fields) {
-                if (f.defaultval && f.giventype.utr->t == V_ANY) {
+                if (f.defaultval && f.giventype.utr->t == V_ANY && !predeclaration) {
                     // FIXME: would be good to not call TT here generically but instead have some
                     // specialized checking, just in case TT has a side effect on type checking.
                     // Sadly that is not easy given the amount of type-checking code this already
@@ -702,13 +709,13 @@ struct TypeChecker {
                     DecBorrowers(f.defaultval->lt, errn);
                     f.defaultval->lt = LT_UNDEF;
                     f.giventype.utr = f.defaultval->exptype;
-                    f.resolvedtype = f.defaultval->exptype;
+                    f.set_resolvedtype(f.defaultval->exptype);
                 }
             }
         }
         for (auto &g : udt.generics) {
             if (!g.giventype.utr.Null()) {
-                g.resolvedtype = ResolveTypeVars(g.giventype, &errn);
+                g.set_resolvedtype(ResolveTypeVars(g.giventype, &errn));
             }
         }
         if (!udt.is_generic) {
@@ -717,7 +724,7 @@ struct TypeChecker {
             // FIXME: bound_typevars_stack does NOT contain any parent nested typevars!
             st.bound_typevars_stack.push_back(&udt.generics);
             for (auto &field : udt.fields) {
-                field.resolvedtype = ResolveTypeVars(field.giventype, &errn);
+                field.set_resolvedtype(ResolveTypeVars(field.giventype, &errn));
             }
             st.bound_typevars_stack.pop_back();
         }
@@ -725,10 +732,10 @@ struct TypeChecker {
             // NOTE: all users of sametype will only act on it if it is numeric, since
             // otherwise it would a scalar field to become any without boxing.
             if (udt.fields.size() >= 1) {
-                udt.sametype = udt.fields[0].resolvedtype;
+                udt.sametype = udt.fields[0].resolvedtype();
                 for (size_t i = 1; i < udt.fields.size(); i++) {
                     // Can't use Union here since it will bind variables, use simplified alternative:
-                    if (!udt.fields[i].resolvedtype->Equal(*udt.sametype)) {
+                    if (!udt.fields[i].resolvedtype()->Equal(*udt.sametype)) {
                         udt.sametype = type_undefined;
                         break;
                     }
@@ -737,7 +744,7 @@ struct TypeChecker {
             // Update the type to the correct struct type.
             if (udt.is_struct) {
                 for (auto &field : udt.fields) {
-                    if (IsRefNil(field.resolvedtype->t)) {
+                    if (IsRefNil(field.resolvedtype()->t)) {
                         udt.hasref = true;
                         break;
                     }
@@ -752,47 +759,46 @@ struct TypeChecker {
                 // generic definition, e.g. `next:Node<T>` which then automatically
                 // gets specialized for `SubNode<int>` etc.
                 for (auto &field : udt.fields) {
-                    PromoteStructIdx(field.resolvedtype, udt.first, udt);
+                    PromoteStructIdx(field, udt.first, udt);
                 }
             }
         }
-        if (!udt.given_superclass.Null()) {
-            udt.resolved_superclass =
-                ResolveTypeVars({ udt.given_superclass }, &errn)->udt;
+        if (!udt.superclass.giventype.utr.Null()) {
+            udt.superclass.set_resolvedtype(ResolveTypeVars(udt.superclass.giventype, &errn));
         }
-        if (!udt.given_superclass.Null()) {
+        if (!udt.superclass.giventype.utr.Null()) {
             // This points to a generic version of the superclass of this class.
             // See if we can find a matching specialization instead.
-            for (auto sti = udt.given_superclass->spec_udt->udt->first; sti; sti = sti->next) {
+            for (auto sti = udt.superclass.giventype.utr->spec_udt->udt->first; sti;
+                 sti = sti->next) {
                 for (size_t i = 0; i < sti->fields.size(); i++) {
-                    if (!sti->fields[i].resolvedtype->Equal(*udt.fields[i].resolvedtype)) {
+                    if (!sti->fields[i].utype()->Equal(*udt.fields[i].utype(), true)) {
                         goto fail;
                     }
                 }
                 {
                     auto nt = st.NewSpecUDT(sti);
-                    udt.given_superclass = nt;
-                    udt.resolved_superclass = sti;
+                    udt.superclass.giventype.utr = nt;
+                    udt.superclass.set_resolvedtype(&sti->thistype);
                     goto done;
                 }
                 fail:;
             }
             Error(errn, "can't find specialized superclass for ", Q(udt.name));
-            //udt.given_superclass = nullptr;
-            //udt.resolved_superclass = nullptr;
+            //udt.superclass = GivenResolve();
             done:;
         }
-        if (udt.resolved_superclass) {
+        if (!udt.superclass.resolved_null() && !udt.is_generic) {
             // If this type has fields inherited from the superclass that refer to the
             // superclass, make it refer to this type instead. There may be corner cases where
             // this is not what you want, but generally you do.
             for (auto &field : gsl::make_span(udt.fields.data(),
-                udt.resolved_superclass->fields.size())) {
-                PromoteStructIdx(field.resolvedtype, udt.resolved_superclass, udt);
+                udt.superclass.resolved_udt()->fields.size())) {
+                PromoteStructIdx(field, udt.superclass.resolved_udt(), udt);
             }
         }
         if (udt.FullyBound()) {
-            for (auto u = &udt; u; u = u->resolved_superclass) {
+            for (auto u = &udt; u; u = u->superclass.resolved_udt()) {
                 if (u->subudts_dispatched) {
                     // This is unfortunate, but code ordering has made it such that a
                     // dispatch has already been typechecked before this udt has been
@@ -806,32 +812,29 @@ struct TypeChecker {
                 u->subudts.push_back(&udt);
             }
         }
-        for (auto [i, f] : enumerate(udt.fields)) {
-            // FIXME: this is a temp limitation, remove.
-            if (udt.thistype.t == V_STRUCT_R && i &&
-                IsRefNil(f.resolvedtype->t) != IsRefNil(udt.fields[0].resolvedtype->t))
-                Error(errn, "structs fields of ", Q(udt.name),
-                            " must be either all scalar or all references");
-        }
         if (!udt.ComputeSizes())
             Error(errn, "struct ", Q(udt.name), " cannot be self-referential");
     }
 
-    void RetVal(TypeRef type, SubFunction *sf, const Node &err, bool register_return = true) {
-        if (register_return) {
-            for (auto isc : reverse(scopes)) {
-                if (isc.sf->parent == sf->parent) break;
-                // isc.sf is a function in the call chain between the return statement and the
-                // function it is returning from. Since we're affecting the return type of the
-                // function we're returning from, if it gets specialized but a function along the
-                // call chain (isc.sf) does not, we must ensure that return type affects the second
-                // specialization.
-                // We do this by tracking return types, and replaying them when a function gets
-                // reused.
-                // A simple test case is in return_from unit test, and recursive_exception is also
-                // affected.
-                isc.sf->reuse_return_events.push_back({ sf, type });
+    void RetVal(TypeRef type, SubFunction *sf, const Node &err) {
+        for (auto isc : reverse(scopes)) {
+            if (isc.sf->parent == sf->parent) break;
+            // isc.sf is a function in the call chain between the return statement and the
+            // function it is returning from. Since we're affecting the return type of the
+            // function we're returning from, if it gets specialized but a function along the
+            // call chain (isc.sf) does not, we must ensure that return type affects the second
+            // specialization.
+            // We do this by tracking return types, and replaying them when a function gets
+            // reused.
+            // A simple test case is in return_from unit test, and recursive_exception is also
+            // affected.
+            // Check if return event already exists, which may happen for multiple similar return
+            // statement of when called from ReplayReturns in a similar call context. 
+            for (auto &rre : isc.sf->reuse_return_events) {
+                if (rre.first == sf && rre.second->Equal(*type)) goto found;
             }
+            isc.sf->reuse_return_events.push_back({ sf, type });
+            found:;
         }
         sf->num_returns++;
         if (sf != scopes.back().sf) sf->num_returns_non_local++;
@@ -955,7 +958,8 @@ struct TypeChecker {
         sf->method_of = esf->method_of;
         sf->generics = esf->generics;
         sf->giventypes = esf->giventypes;
-        sf->returned_thru_to = nullptr;
+        sf->returned_thru_to_max = -1;
+        sf->attributes = esf->attributes;
         return sf;
     }
 
@@ -985,14 +989,9 @@ struct TypeChecker {
                 Error(context, "cannot return out of dynamic function value (",
                       Q(sf_to->parent->name), " not found on the callstack)");
             }
-            // Mark any functions we may be returning thru as such.
-            if (sf->returned_thru_to && sf->returned_thru_to != sf_to) {
-                Error(context, "non-local return to ", Q(sf_to->parent->name), " (through ",
-                      Q(sf->parent->name), ") already returned to ",
-                      Q(sf->returned_thru_to->parent->name));
-            }
         }
-        sf->returned_thru_to = sf_to;
+        auto nretslots = ValWidthMulti(sf_to->returntype, sf_to->returntype->NumValues());
+        sf->returned_thru_to_max = std::max(sf->returned_thru_to_max, nretslots);
     }
 
     TypeRef TypeCheckMatchingCall(SubFunction *sf, List &call_args, bool static_dispatch,
@@ -1053,7 +1052,7 @@ struct TypeChecker {
                 if (isc.sf->parent == isf->parent) {
                     // NOTE: will have to re-apply lifetimes as well if we change
                     // from default of LT_KEEP.
-                    RetVal(type, isc.sf, call_context, false);
+                    RetVal(type, isc.sf, call_context);
                     // This should in theory not cause an error, since the previous
                     // specialization was also ok with this set of return types.
                     // It could happen though if this specialization has an
@@ -1073,6 +1072,7 @@ struct TypeChecker {
         }
     };
 
+    // See also EarlyResolve.
     TypeRef ResolveTypeVars(UnresolvedTypeRef utype, const Node *errn) {
         auto type = utype.utr;
         switch (type->t) {
@@ -1111,7 +1111,7 @@ struct TypeChecker {
                     if (udti->FullyBound()) {
                         assert(udti->generics.size() == types.size());
                         for (auto [i, btv] : enumerate(udti->generics)) {
-                            if (!btv.resolvedtype->Equal(*types[i])) goto nomatch;
+                            if (!btv.resolvedtype()->Equal(*types[i])) goto nomatch;
                         }
                         return &udti->thistype;
                         nomatch:;
@@ -1131,13 +1131,14 @@ struct TypeChecker {
                     g.Resolve(types[i]);
                     udt->unspecialized.specializers.push_back(&*types[i]);
                 }
-                TypeCheckUDT(*udt, *errn);
+                TypeCheckUDT(*udt, *errn, false);
                 return &udt->thistype;
             }
             case V_TYPEVAR: {
                 for (auto bvec : reverse(st.bound_typevars_stack)) {
                     for (auto &btv : *bvec) {
-                        if (btv.tv == type->tv && !btv.resolvedtype.Null()) return btv.resolvedtype;
+                        if (btv.tv == type->tv && !btv.resolved_null())
+                            return btv.resolvedtype();
                     }
                 }
                 if (errn) Error(*errn, "could not resolve type variable ", Q(type->tv->name));
@@ -1163,7 +1164,7 @@ struct TypeChecker {
         }
         if (otype->t == V_TYPEVAR) {
             for (auto &btv : generics) {
-                if (btv.tv == otype->tv && btv.resolvedtype.Null()) {
+                if (btv.tv == otype->tv && btv.resolved_null()) {
                     btv.Resolve(atype);
                     break;
                 }
@@ -1175,7 +1176,7 @@ struct TypeChecker {
                    otype->spec_udt->udt->first == atype->udt->first) {
             assert(otype->spec_udt->specializers.size() == atype->udt->generics.size());
             for (auto [i, s] : enumerate(otype->spec_udt->specializers)) {
-                BindTypeVar({ s }, atype->udt->generics[i].resolvedtype, generics,
+                BindTypeVar({ s }, atype->udt->generics[i].resolvedtype(), generics,
                             otype->spec_udt->udt);
             }
         }
@@ -1189,7 +1190,7 @@ struct TypeChecker {
         sf = f.overloads[overload_idx].sf;
         // Collect generic type values.
         vector<BoundTypeVariable> generics = sf->generics;
-        for (auto &btv : generics) btv.resolvedtype = nullptr;
+        for (auto &btv : generics) btv.set_resolvedtype(nullptr);
         if (specializers) {
             if (specializers->size() > generics.size())
                 Error(call_args, "too many specializers given");
@@ -1199,9 +1200,10 @@ struct TypeChecker {
         for (auto [i, c] : enumerate(call_args.children)) {
             BindTypeVar(sf->giventypes[i], c->exptype, generics);
         }
-        for (auto &btv : generics) if (btv.resolvedtype.Null())
-            Error(call_args, "cannot implicitly bind type variable ", Q(btv.tv->name),
-                             " in call to ", Q(f.name), " (argument doesn't match?)");
+        for (auto &btv : generics)
+            if (btv.resolved_null())
+                Error(call_args, "cannot implicitly bind type variable ", Q(btv.tv->name),
+                                 " in call to ", Q(f.name), " (argument doesn't match?)");
         // Check if we need to specialize: generic args, free vars and need of retval
         // must match previous calls.
         auto AllowAnyLifetime = [&](const Arg &arg) {
@@ -1222,7 +1224,7 @@ struct TypeChecker {
                         goto fail;
                 }
                 for (auto [i, btv] : enumerate(sf->generics)) {
-                    if (!btv.resolvedtype->Equal(*generics[i].resolvedtype)) goto fail;
+                    if (!btv.resolvedtype()->Equal(*generics[i].resolvedtype())) goto fail;
                 }
                 if (SpecializationIsCompatible(*sf, reqret)) {
                     // This function can be reused.
@@ -1364,7 +1366,7 @@ struct TypeChecker {
             // Typecheck all the individual functions.
             SubFunction *last_sf = nullptr;
             bool any_recursive = false;
-            const SubFunction *any_returned_thru = nullptr;
+            int any_returned_thru_max = -1;
             for (auto [i, udt] : enumerate(dispatch_udt.subudts)) {
                 auto sf = udt->dispatch[vtable_idx].sf;
                 // Missing implementation for unused UDT.
@@ -1385,15 +1387,7 @@ struct TypeChecker {
                 sf->method_of = udt;
                 sf->method_of->dispatch[vtable_idx].sf = sf;
                 if (sf->isrecursivelycalled) any_recursive = true;
-                if (sf->returned_thru_to) {
-                    if (any_returned_thru && any_returned_thru != sf->returned_thru_to) {
-                        Error(*sf->sbody, "non-local return through dynamic dispatch of ",
-                                          Q(sf->parent->name), " to both ",
-                                          Q(any_returned_thru->parent->name), " and ",
-                                          Q(sf->returned_thru_to->parent->name));
-                    }
-                    any_returned_thru = sf->returned_thru_to;
-                }
+                any_returned_thru_max = std::max(any_returned_thru_max, sf->returned_thru_to_max);
                 auto u = sf->returntype;
                 if (de->returntype->IsBoundVar()) {
                     // FIXME: can this still happen now that recursive cases use explicit return
@@ -1439,10 +1433,13 @@ struct TypeChecker {
                     }
                 }
                 last_sf = sf;
+                // Even if this sf is not returned thru, there may be an unwind check due to other
+                // sfs in the dispatch.
+                sf->returned_thru_to_max = std::max(sf->returned_thru_to_max, any_returned_thru_max);
             }
-            if (any_returned_thru) {
-                dispatch_udt.dispatch[vtable_idx].returned_thru_to = any_returned_thru;
-            }
+            dispatch_udt.dispatch[vtable_idx].returned_thru_to_max =
+                std::max(dispatch_udt.dispatch[vtable_idx].returned_thru_to_max,
+                         any_returned_thru_max);
             call_args.children[0]->exptype = &dispatch_udt.thistype;
         }
         return dispatch_udt.dispatch[vtable_idx].returntype;
@@ -1467,7 +1464,7 @@ struct TypeChecker {
         if (dispatch_udt) {
             if (super) {
                 // We're forcing static dispatch to the superclass;
-                type0 = &dispatch_udt->resolved_superclass->thistype;
+                type0 = &dispatch_udt->superclass.resolved_udt()->thistype;
             } else {
                 // Go thru all other overloads, and see if any of them have this one as superclass.
                 for (auto &ov : csf->parent->overloads) {
@@ -1481,131 +1478,130 @@ struct TypeChecker {
             }
             // Yay there are no sub-class implementations, we can just statically dispatch.
         }
-        // Do a static dispatch, if there are overloads, figure out from first arg which to pick,
+        // Do a static dispatch.
+        // if there are overloads, figure out from first arg which to pick,
         // much like dynamic dispatch. Unlike dynamic dispatch, we also include non-class types.
         // TODO: also involve the other arguments for more complex static overloads?
-
-        // FIXME: the use of args[0].type here and further downstream only works because
+        // FIXME: the use of args[].type here and further downstream only works because
         // we pre-resolve these in the TypeChecker constructor, instead we should use giventypes
         // properly here, and resolve them.
-        int overload_idx = 0;
-        if (f.nargs() && f.overloads.size() > 1) {
-            overload_idx = -1;
-            // First see if there is an exact match.
-            for (auto [i, ov] : enumerate(f.overloads)) {
-                if (type0->Equal(*ov.sf->args[0].type)) {
-                    if (overload_idx >= 0)
-                        Error(call_args, "multiple overloads for ", Q(f.name),
-                                         " have the same first argument type ", Q(TypeName(type0)));
-                    overload_idx = (int)i;
+        vector<int> from;
+        for (int i = 0; i < (int)f.overloads.size(); i++) from.push_back(i);
+        for (int argidx = 0; ; argidx++) {
+            if (from.size() == 1) {
+                // We're done, found unique match.
+                LOG_DEBUG("static dispatch: ", Signature(*f.overloads[from[0]].sf));
+                return TypeCheckCallStatic(csf, call_args, reqret, specializers, from[0], true,
+                                           false);
+            }
+            if ((int)f.nargs() == argidx) {
+                // Gotten to the end and we still have multiple matches!
+                if (specializers) {
+                    // Last ditch effort: remove overloads that don't match the generic params.
+                    from.erase(remove_if(from.begin(), from.end(), [&](int i) {
+                        return specializers->size() != f.overloads[i].sf->generics.size();
+                    }), from.end());
+                    if (from.size() == 1) {
+                        argidx--;
+                        continue;
+                    }
                 }
+                Error(call_args, "multiple overloads for ", Q(f.name), " match the argument types");
+            }
+            // Now filter existing matches into a new set of matches based on current arg.
+            vector<int> matches;
+            auto type = argidx ? call_args.children[argidx]->exptype : type0;
+            // First see if there is an exact match.
+            for (auto i : from) {
+                auto &ov = f.overloads[i];
+                if (type->Equal(*ov.sf->args[argidx].type)) matches.push_back(i);
             }
             // Then see if there's a match if we'd instantiate a generic UDT  first arg.
-            if (overload_idx < 0 && IsUDT(type0->t)) {
-                for (auto [i, ov] : enumerate(f.overloads)) {
-                    auto arg0 = ov.sf->giventypes[0].utr;  // Want unresolved type.
-                    if (arg0->t == V_UUDT && arg0->spec_udt->udt == type0->udt->first) {
-                        if (overload_idx >= 0) {
-                            Error(call_args, "multiple generic overloads for ", Q(f.name),
-                                             " can instantiate the first argument type ",
-                                             Q(TypeName(type0)));
-                        }
-                        overload_idx = (int)i;
+            if (matches.empty() && IsUDT(type->t)) {
+                for (auto i : from) {
+                    auto &ov = f.overloads[i];
+                    auto arg = ov.sf->giventypes[argidx].utr;  // Want unresolved type.
+                    if (arg->t == V_UUDT && arg->spec_udt->udt == type->udt->first) {
+                        matches.push_back(i);
                     }
                 }
             }
             // Then see if there's a match by subtyping.
-            if (overload_idx < 0) {
-                for (auto [i, ov] : enumerate(f.overloads)) {
-                    auto arg0 = ov.sf->args[0].type;
-                    if (ConvertsTo(type0, arg0, CF_NONE)) {
-                        if (overload_idx >= 0) {
-                            if (type0->t == V_CLASS) {
-                                auto oarg0 = f.overloads[overload_idx].sf->args[0].type;
-                                // Prefer "closest" supertype.
-                                auto dist = st.SuperDistance(arg0->udt, type0->udt);
-                                auto odist = st.SuperDistance(oarg0->udt, type0->udt);
-                                if (dist < odist) overload_idx = (int)i;
-                                else if (odist < dist) { /* keep old one */ }
-                                else {
-                                    Error(call_args, "multiple overloads for ", Q(f.name),
-                                                     " have the same class for first argument type ",
-                                                      Q(TypeName(type0)));
-                                }
+            if (matches.empty()) {
+                for (auto i : from) {
+                    auto &ov = f.overloads[i];
+                    auto arg = ov.sf->args[argidx].type;
+                    if (ConvertsTo(type, arg, CF_NONE)) {
+                        if (matches.size() == 1 && type->t == V_CLASS) {
+                            auto oarg = f.overloads[matches[0]].sf->args[argidx].type;
+                            // Prefer "closest" supertype.
+                            auto dist = st.SuperDistance(arg->udt, type->udt);
+                            auto odist = st.SuperDistance(oarg->udt, type->udt);
+                            if (dist < odist) {
+                                matches[0] = i;  // Overwrite with better pick.
+                            } else if (odist < dist) {
+                                // Keep old one.
                             } else {
-                                Error(call_args, "multiple overloads for ", Q(f.name),
-                                                 " apply for the first argument type ",
-                                                 Q(TypeName(type0)));
+                                // Keep both, and hope the next arg disambiguates.
+                                matches.push_back(i);
                             }
                         } else {
-                            overload_idx = (int)i;
+                            matches.push_back(i);
                         }
                     }
                 }
             }
             // Then see if there's a match if we'd instantiate a fully generic first arg.
-            if (overload_idx < 0) {
-                for (auto [i, ov] : enumerate(f.overloads)) {
-                    auto arg0 = ov.sf->giventypes[0].utr;  // Want unresolved type.
-                    if (arg0->t == V_TYPEVAR) {
-                        if (overload_idx >= 0) {
-                            Error(call_args, "multiple generic overloads for ", Q(f.name),
-                                             " can instantiate the first argument type ",
-                                             Q(TypeName(type0)));
-                        }
-                        overload_idx = (int)i;
-                    }
+            if (matches.empty()) {
+                for (auto i : from) {
+                    auto &ov = f.overloads[i];
+                    auto arg = ov.sf->giventypes[argidx].utr;  // Want unresolved type.
+                    if (arg->t == V_TYPEVAR) { matches.push_back(i); }
                 }
             }
             // If the call has specializers, we should see bind those and see if they
             // uniquely identify an overload, e.g. for a [T] arg where T is now bound, or other
             // cases where the trivial case of T above doesn't apply.
-            if (overload_idx < 0 && specializers && !specializers->empty()) {
+            if (matches.empty() && specializers && !specializers->empty()) {
                 // FIXME: This overlaps somewhat with resolving them during TypeCheckCallStatic
                 vector<BoundTypeVariable> generics(specializers->size());
                 for (auto [i, btv] : enumerate(generics)) {
-                    btv.resolvedtype = nullptr;
+                    btv.set_resolvedtype(nullptr);
                     btv.giventype = specializers->at(i);
                 }
-                for (auto [i, ov] : enumerate(f.overloads)) {
+                for (auto i : from) {
+                    auto &ov = f.overloads[i];
                     if (generics.size() != ov.sf->generics.size()) continue;
                     for (auto [i, btv] : enumerate(generics)) {
                         btv.tv = ov.sf->generics[i].tv;
                         btv.Resolve(ResolveTypeVars(btv.giventype, &call_args));
                     }
                     st.bound_typevars_stack.push_back(&generics);
-                    auto arg0 = ResolveTypeVars(ov.sf->giventypes[0], &call_args);
+                    auto arg = ResolveTypeVars(ov.sf->giventypes[argidx], &call_args);
                     st.bound_typevars_stack.pop_back();
                     // TODO: Should we instead do ConvertsTo here?
-                    if (type0->Equal(*arg0)) {
-                        if (overload_idx >= 0)
-                            Error(call_args, "multiple overloads for ", Q(f.name),
-                                             " apply when specialized for the first argument type ",
-                                             Q(TypeName(type0)));
-                        overload_idx = (int)i;
+                    if (type->Equal(*arg)) {
+                        matches.push_back(i);
                     }
                 }
             }
             // Then finally try with coercion.
-            if (overload_idx < 0) {
-                for (auto [i, ov] : enumerate(f.overloads)) {
-                    if (ConvertsTo(type0, ov.sf->args[0].type, CF_COERCIONS)) {
-                        if (overload_idx >= 0) {
-                            Error(call_args, "multiple overloads for ", Q(f.name),
-                                             " can coerce to first argument type ",
-                                             Q(TypeName(type0)));
-                        }
-                        overload_idx = (int)i;
+            if (matches.empty()) {
+                for (auto i : from) {
+                    auto &ov = f.overloads[i];
+                    if (ConvertsTo(type, ov.sf->args[argidx].type, CF_COERCIONS)) {
+                        matches.push_back(i);
                     }
                 }
             }
-            if (overload_idx < 0)
-                Error(call_args, "no overloads apply for ", Q(f.name), " with first argument type ",
-                                 Q(TypeName(type0)));
+            // Empty set: current arg can't select with any of the above methods.
+            if (matches.empty()) {
+                Error(call_args, "no overloads apply for ", Q(f.name), " with ", ArgName(argidx),
+                      " argument type ", Q(TypeName(type)));
+            }
+            // We still have multiple matches that apply, so let the next arg(s) decide.
+            from = matches;
         }
-        LOG_DEBUG("static dispatch: ", Signature(*f.overloads[overload_idx].sf));
-        return TypeCheckCallStatic(csf, call_args, reqret, specializers,
-                                   overload_idx, true, false);
     }
 
     SubFunction *PreSpecializeFunction(SubFunction *hsf) {
@@ -1687,7 +1683,7 @@ struct TypeChecker {
         condition = SkipCoercions(condition);
         auto type = condition->exptype;
         if (auto c = Is<IsType>(condition)) {
-            if (iftrue) CheckFlowTypeIdOrDot(*c->child, c->resolvedtype);
+            if (iftrue) CheckFlowTypeIdOrDot(*c->child, c->gr.resolvedtype());
         } else if (auto c = Is<Not>(condition)) {
             CheckFlowTypeChangesSub(!iftrue, c->child);
         } else if (auto eq = Is<Equal>(condition)) {
@@ -2475,20 +2471,25 @@ Node *Define::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
         auto var = TypeLT(*child, i);
         if (!p.second.utr.Null()) {
             var.type = tc.ResolveTypeVars(p.second, this);
-            // Have to subtype the initializer value, as that node may contain
-            // unbound vars (a:[int] = []) or values that that need to be coerced
-            // (a:float = 1)
-            if (sids.size() == 1) {
-                tc.SubType(child, var.type, "initializer", "definition");
+            if (Is<DefaultVal>(child)) {  // A pre-decl.
+                p.first->id->predeclaration = true;
             } else {
-                // FIXME: no coercion when mult-return?
-                tc.SubTypeT(child->exptype->Get(i), var.type, *this, p.first->id->name);
+                p.first->id->predeclaration = false;
+                // Have to subtype the initializer value, as that node may contain
+                // unbound vars (a:[int] = []) or values that that need to be coerced
+                // (a:float = 1)
+                if (sids.size() == 1) {
+                    tc.SubType(child, var.type, "initializer", "definition");
+                } else {
+                    // FIXME: no coercion when mult-return?
+                    tc.SubTypeT(child->exptype->Get(i), var.type, *this, p.first->id->name);
+                }
+                // In addition, the initializer may already cause the type to be promoted.
+                // a:string? = ""
+                FlowItem fi(p.first, var.type, child->exptype);
+                // Similar to AssignFlowPromote (TODO: refactor):
+                if (fi.now->t != V_NIL && fi.old->t == V_NIL) tc.flowstack.push_back(fi);
             }
-            // In addition, the initializer may already cause the type to be promoted.
-            // a:string? = ""
-            FlowItem fi(p.first, var.type, child->exptype);
-            // Similar to AssignFlowPromote (TODO: refactor):
-            if (fi.now->t != V_NIL && fi.old->t == V_NIL) tc.flowstack.push_back(fi);
         }
         auto sid = p.first;
         sid->type = var.type;
@@ -2507,6 +2508,9 @@ Node *AssignList::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
         if (c != children.back()) {
             tc.TT(c, 1, LT_BORROW);
             tc.DecBorrowers(c->lt, *this);
+            if (!Is<IdentRef>(c) && !Is<Dot>(c)) {
+                tc.Error(*this, "assignment list elements must be variables or class members");
+            }
         } else {
             tc.TT(c, children.size() - 1, LT_MULTIPLE /*unused*/, &children);
         }
@@ -2714,6 +2718,8 @@ Node *IdentRef::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
     for (auto &sc : reverse(tc.scopes)) if (sc.sf == sid->sf_def) goto in_scope;
     tc.Error(*this, "free variable ", Q(sid->id->name), " not in scope");
     in_scope:
+    if (sid->id->predeclaration)
+        tc.Error(*this, "access of ", Q(sid->id->name), " before being initialized");
     exptype = tc.TypeCheckId(sid);
     FlowItem fi(*this, exptype);
     assert(fi.IsValid());
@@ -2937,7 +2943,7 @@ Node *NativeCall::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
                 if (nftype->t == V_TYPEID) {
                     assert(!sa);  // assumes always first.
                     auto tin = AssertIs<TypeOf>(children[0]);
-                    if (!Is<DefaultVal>(tin->child)) type = tin->child->exptype;
+                    type = tin->child->exptype;
                 }
 
                 if (ret.type->t == V_NIL) {
@@ -3033,15 +3039,6 @@ Node *Return::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
             break;
         }
     }
-    // Now we can check what we're returning past as well.
-    for (auto isc : reverse(tc.scopes)) {
-        if (isc.sf->parent == sf->parent) {
-            goto destination_found;
-        }
-        tc.CheckReturnPast(isc.sf, sf, *this);
-    }
-    tc.Error(*this, "return from ", Q(sf->parent->name), " called out of context");
-    destination_found:
     // TODO: LT_KEEP here is to keep it simple for now, since ideally we want to also allow
     // LT_BORROW, but then we have to prove that we don't outlive the owner.
     // Additionally, we have to do this for reused specializations on new SpecIdents.
@@ -3103,6 +3100,14 @@ Node *Return::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
         tc.RetVal(type_void, sf, *this);
         tc.SubType(child, sf->returntype, "", *this);
     }
+    // Now we can check what we're returning past as well.
+    // Do this last, since we want RetVal to have been called on sf.
+    for (auto isc : reverse(tc.scopes)) {
+        if (isc.sf->parent == sf->parent) { goto destination_found; }
+        tc.CheckReturnPast(isc.sf, sf, *this);
+    }
+    tc.Error(*this, "return from ", Q(sf->parent->name), " called out of context");
+    destination_found:
     return this;
 }
 
@@ -3116,7 +3121,7 @@ Node *IsType::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
     tc.TT(child, 1, LT_BORROW);
     tc.NoStruct(*child, "is");  // FIXME
     tc.DecBorrowers(child->lt, *this);
-    resolvedtype = tc.ResolveTypeVars(giventype, this);
+    gr.set_resolvedtype(tc.ResolveTypeVars(gr.giventype, this));
     exptype = &tc.st.default_bool_type->thistype;
     lt = LT_ANY;
     // Check for constness early, to be able to lift out side effects, which
@@ -3162,7 +3167,12 @@ Node *Constructor::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
     } else {
         exptype = tc.ResolveTypeVars(giventype, this);
         auto udt = IsUDT(exptype->t) ? exptype->udt : nullptr;
-        if (udt) tc.st.bound_typevars_stack.push_back(&udt->generics);
+        if (udt) {
+            // Sadly, this causes more problems than it solves, since these UDTs may depend
+            // on global vars not typechecked, etc.
+            //tc.TypeCheckUDT(*udt, *this, true);
+            tc.st.bound_typevars_stack.push_back(&udt->generics);
+        }
         // These may include field initializers copied from the definition, which may include
         // type variables that are now bound.
         tc.TypeCheckList(this, LT_KEEP);
@@ -3184,7 +3194,7 @@ Node *Constructor::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
                 int nmatches = 0;
                 for (auto [i, arg] : enumerate(children)) {
                     auto &field = udti->fields[i];
-                    if (tc.ConvertsTo(arg->exptype, field.resolvedtype,
+                    if (tc.ConvertsTo(arg->exptype, field.utype(),
                                       CF_NONE)) nmatches++;
                     else break;
                 }
@@ -3208,7 +3218,7 @@ Node *Constructor::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
         exptype = &udt->thistype;
     }
     for (auto [i, c] : enumerate(children)) {
-        TypeRef elemtype = IsUDT(exptype->t) ? exptype->udt->fields[i].resolvedtype
+        TypeRef elemtype = IsUDT(exptype->t) ? exptype->udt->fields[i].resolvedtype()
                                              : exptype->Element();
         tc.SubType(c, elemtype, tc.ArgName(i), *this);
     }
@@ -3233,7 +3243,7 @@ Node *Dot::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
     auto &field = udt->fields[fieldidx];
     if (field.isprivate && line.fileidx != field.defined_in.fileidx)
         tc.Error(*this, "field ", Q(field.id->name), " is private");
-    exptype = field.resolvedtype;
+    exptype = field.resolvedtype();
     FlowItem fi(*this, exptype);
     if (fi.IsValid()) exptype = tc.UseFlow(fi);
     lt = tc.PushBorrow(this);
@@ -3263,8 +3273,8 @@ Node *Indexing::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
             auto &udt = *itype->udt;
             exptype = vtype;
             for (auto &field : udt.fields) {
-                if (field.resolvedtype->t != V_INT)
-                    tc.RequiresError("int field", field.resolvedtype, *this, "index");
+                if (field.resolvedtype()->t != V_INT)
+                    tc.RequiresError("int field", field.resolvedtype(), *this, "index");
                 if (exptype->t != V_VECTOR)
                     tc.RequiresError("nested vector", exptype, *this, "container");
                 exptype = exptype->Element();
@@ -3317,7 +3327,7 @@ Node *EnumRef::TypeCheck(TypeChecker & /*tc*/, size_t /*reqret*/) {
 }
 
 Node *UDTRef::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
-    tc.TypeCheckUDT(*udt, *this);
+    tc.TypeCheckUDT(*udt, *this, predeclaration);
     exptype = type_void;
     lt = LT_ANY;
     return this;

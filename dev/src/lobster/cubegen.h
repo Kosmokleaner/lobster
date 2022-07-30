@@ -17,13 +17,24 @@
 
 const uint8_t transparant = 0;
 
-struct Voxels {
-    vector<byte4> palette;
-    bool is_default_palette;
+struct Palette {
+    vector<byte4> colors;
+    uint64_t hash = 0;
+};
+
+const size_t default_palette_idx = 0;
+const size_t normal_palette_idx = 1;
+
+extern vector<Palette> palettes;
+
+struct Voxels : lobster::Resource {
+    size_t palette_idx;
+    bool chunks_skipped = false;
     Chunk3DGrid<uint8_t> grid;
     int idx = 0;
+    string name;
 
-    Voxels(const int3 &dim) : is_default_palette(true), grid(dim, transparant) {}
+    Voxels(const int3 &dim, size_t idx) : palette_idx(idx), grid(dim, transparant) {}
 
     template<typename F> void Do(const int3 &p, const int3 &sz, F f) {
         for (int x = max(0, p.x); x < min(p.x + sz.x, grid.dim.x); x++) {
@@ -56,7 +67,7 @@ struct Voxels {
 
     uint8_t Color2Palette(const float4 &color) const {
         if (color.w < 0.5f) return transparant;
-        if (is_default_palette) {  // Fast path.
+        if (palette_idx == default_palette_idx) {  // Fast path.
             auto ic = byte4((int4(quantizec(color)) + (0x33 / 2)) / 0x33);
             // For some reason the palette has red where black should be??
             if (!ic.x && !ic.y && !ic.z) return 255;
@@ -66,24 +77,21 @@ struct Voxels {
         }
         float error = 999999;
         uint8_t pi = transparant;
+        auto &palette = palettes[palette_idx].colors;
         for (size_t i = 1; i < palette.size(); i++) {
             auto err = squaredlength(color2vec(palette[i]) - color);
             if (err < error) { error = err; pi = (uint8_t)i; }
         }
         return pi;
     }
+
+    size_t2 MemoryUsage() {
+        // FIXME: does NOT account for shared palettes.
+        return { sizeof(Voxels) + grid.dim.volume() + grid.dim.x * sizeof(void *), 0 };
+    }
 };
 
 namespace lobster {
-
-inline ResourceType *GetVoxelType() {
-    static ResourceType voxel_type = { "voxels", [](void *v) { delete (Voxels *)v; } };
-    return &voxel_type;
-}
-
-inline Voxels &GetVoxels(VM &vm, const Value &res) {
-    return *GetResourceDec<Voxels *>(vm, res, GetVoxelType());
-}
 
 Value CubesFromMeshGen(VM &vm, const DistGrid &grid, int targetgridsize, int zoffset);
 

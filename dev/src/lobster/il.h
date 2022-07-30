@@ -20,7 +20,7 @@
 
 namespace lobster {
 
-const int LOBSTER_BYTECODE_FORMAT_VERSION = 19;
+const int LOBSTER_BYTECODE_FORMAT_VERSION = 20;
 
 // Any type specialized ops below must always have this ordering.
 enum MathOp {
@@ -64,13 +64,13 @@ enum MathOp {
     F(BCALLRET7,    2, ILUNKNOWN, ILUNKNOWN) \
     F(ASSERT,       3, 1, 0) \
     F(ASSERTR,      3, 1, 1) \
-    F(ENDSTATEMENT, 2, 0, 0) \
+    F(STATEMENT,    2, 0, 0) \
+    F(PROFILE,      1, 0, 0) \
     F(NEWVEC,       2, ILUNKNOWN, 1) \
     F(NEWOBJECT,    1, ILUNKNOWN, 1) \
     F(POP,          0, 1, 0) \
     F(POPREF,       0, 1, 0) \
     F(POPV,         1, ILUNKNOWN, 0) \
-    F(POPVREF,      1, ILUNKNOWN, 0) \
     F(DUP,          0, 1, 2) \
     F(EXIT,         1, ILUNKNOWN, 0) \
     F(ABORT,        0, 0, 0) \
@@ -97,7 +97,7 @@ enum MathOp {
     F(LOGNOT, 0, 1, 1) F(LOGNOTREF, 0, 1, 1) \
     F(BINAND, 0, 2, 1) F(BINOR, 0, 2, 1) F(XOR, 0, 2, 1) F(ASL, 0, 2, 1) F(ASR, 0, 2, 1) F(NEG, 0, 1, 1) \
     F(I2F, 0, 1, 1) F(A2S, 1, 1, 1) F(E2B, 0, 1, 1) F(E2BREF, 0, 1, 1) F(ST2S, 1, ILUNKNOWN, 1) \
-    F(RETURN, 2, ILUNKNOWN, 0) F(RETURNANY, 2, 0, 0) \
+    F(RETURNLOCAL, 1, ILUNKNOWN, 0) F(RETURNNONLOCAL, 2, ILUNKNOWN, 0) F(RETURNANY, 1, 0, 0) \
     F(ISTYPE, 1, 1, 1) \
     F(FORLOOPI, 0, 1, 2) \
     F(IFORELEM, 0, 2, 3) \
@@ -105,7 +105,7 @@ enum MathOp {
     F(VFORELEM, 0, 2, 3) \
     F(VFORELEMREF, 0, 2, 3) \
     F(VFORELEM2S, 0, 2, ILUNKNOWN) \
-    F(VFORELEMREF2S, 0, 2, ILUNKNOWN) \
+    F(VFORELEMREF2S, 1, 2, ILUNKNOWN) \
     F(INCREF, 1, 0, 0) \
     F(KEEPREF, 2, 0, 0) \
     F(KEEPREFLOOP, 2, 0, 0) \
@@ -125,7 +125,7 @@ enum MathOp {
     F(LV_DUP, 0, 0, 1) \
     F(LV_DUPV, 1, 0, ILUNKNOWN) \
     F(LV_WRITE, 0, 1, 0)  F(LV_WRITEREF, 0, 1, 0)  \
-    F(LV_WRITEV, 1, ILUNKNOWN, 0) F(LV_WRITEREFV, 1, ILUNKNOWN, 0) \
+    F(LV_WRITEV, 1, ILUNKNOWN, 0) F(LV_WRITEREFV, 2, ILUNKNOWN, 0) \
     F(LV_IADD, 0, 1, 0)   F(LV_ISUB, 0, 1, 0)   F(LV_IMUL, 0, 1, 0)   F(LV_IDIV, 0, 1, 0)   \
     F(LV_IMOD, 0, 1, 0)   \
     F(LV_BINAND, 0, 1, 0) F(LV_BINOR, 0, 1, 0)  F(LV_XOR, 0, 1, 0)    \

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "lobster/stdafx.h"
+#include "lobster/il.h"
 #include "lobster/disasm.h"
 
 namespace lobster {
@@ -37,7 +38,8 @@ const bytecode::LineInfo *LookupLine(const int *ip, const int *code,
 }
 
 const int *DisAsmIns(NativeRegistry &nfr, string &sd, const int *ip, const int *code,
-                     const type_elem_t *typetable, const bytecode::BytecodeFile *bcf) {
+                     const type_elem_t *typetable, const bytecode::BytecodeFile *bcf,
+                     int line) {
     auto ilnames = ILNames();
     auto ilarity = ILArity();
     if (code) {
@@ -45,6 +47,8 @@ const int *DisAsmIns(NativeRegistry &nfr, string &sd, const int *ip, const int *
         // FIXME: some indication of the filename, maybe with a table index?
         append(sd, "I ", ip - code, " \t");
         append(sd, "L ", li->line(), " \t");
+    } else if (line >= 0) {
+        append(sd, "L ", line, " \t");
     }
     auto ins_start = ip;
     int opc = *ip++;
@@ -80,9 +84,14 @@ const int *DisAsmIns(NativeRegistry &nfr, string &sd, const int *ip, const int *
             append(sd, *ip++);
             break;
 
-        case IL_RETURN: {
-            auto id = *ip++;
+        case IL_RETURNLOCAL: {
             auto nrets = *ip++;
+            append(sd, nrets);
+            break;
+        }
+        case IL_RETURNNONLOCAL: {
+            auto nrets = *ip++;
+            auto id = *ip++;
             append(sd, bcf->functions()->Get(id)->name()->string_view(), " ", nrets);
             break;
         }
@@ -199,7 +208,7 @@ void DisAsm(NativeRegistry &nfr, string &sd, string_view bytecode_buffer) {
     const int *ip = code;
     while (ip < code + len) {
         if (*ip == IL_FUNSTART) sd += "------- ------- ---\n";
-        ip = DisAsmIns(nfr, sd, ip, code, typetable, bcf);
+        ip = DisAsmIns(nfr, sd, ip, code, typetable, bcf, -1);
         sd += "\n";
         if (!ip) break;
     }

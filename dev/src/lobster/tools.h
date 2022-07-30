@@ -131,7 +131,7 @@ struct DLNodeBase : DLNodeRaw {
 
     bool Connected() { return next && prev; }
 
-    virtual ~DLNodeBase() {
+    ~DLNodeBase() {
         if (Connected()) Remove();
     }
 
@@ -183,7 +183,7 @@ template<typename T> T *Prev(T *n) { return (T *)n->prev; }
 #define loopdllistreverse(L, n) \
     for (auto n = (L).Prev(), p = Prev(n); n != (void *)&(L); (n = p),(p = Prev(n)))
 
-class MersenneTwister          {
+class MersenneTwister {
     const static uint32_t N = 624;
     const static uint32_t M = 397;
     const static uint32_t K = 0x9908B0DFU;
@@ -199,6 +199,8 @@ class MersenneTwister          {
     int left = -1;
 
     public:
+
+    typedef uint32_t rnd_type;
 
     void Seed(uint32_t seed) {
         uint32_t x = (seed | 1U) & 0xFFFFFFFFU, *s = state;
@@ -250,6 +252,8 @@ class PCG32 {
 
     public:
 
+    typedef uint32_t rnd_type;
+
     uint32_t Random() {
         uint64_t oldstate = state;
         // Advance internal state.
@@ -266,17 +270,98 @@ class PCG32 {
     }
 };
 
+// https://thompsonsed.co.uk/random-number-generators-for-c-performance-tested
+// See also SplitMix64Hash below.
+class SplitMix64 {
+    uint64_t x = 0; /* The state can be seeded with any value. */
+
+    public:
+
+    typedef uint64_t rnd_type;
+
+    uint64_t Random() {
+        uint64_t z = (x += UINT64_C(0x9E3779B97F4A7C15));
+        z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+        return z ^ (z >> 31);
+    }
+
+    void ReSeed(uint64_t s) {
+        x = s;
+    }
+};
+
+// https://prng.di.unimi.it/
+// https://nullprogram.com/blog/2017/09/21/
+class Xoshiro256SS {
+    uint64_t s[4];
+
+    static inline uint64_t rotl(const uint64_t x, int k) {
+        return (x << k) | (x >> (64 - k));
+    }
+
+    public:
+
+    typedef uint64_t rnd_type;
+
+    Xoshiro256SS() {
+        ReSeed(0);
+    }
+
+    uint64_t Random() {
+        const uint64_t result = rotl(s[1] * 5, 7) * 9;
+        const uint64_t t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = rotl(s[3], 45);
+        return result;
+    }
+
+    void ReSeed(uint64_t x) {
+        SplitMix64 sm;
+        sm.ReSeed(x);
+        for (int i = 0; i < 4; i++) {
+            s[i] = sm.Random();
+        }
+    }
+
+};
+
 template<typename T> struct RandomNumberGenerator {
     T rnd;
 
-    void seed(uint32_t s) { rnd.ReSeed(s); }
+    void seed(typename T::rnd_type s) {
+        rnd.ReSeed(s);
+    }
 
-    int operator()(int max) { return rnd.Random() % max; }
-    int operator()() { return rnd.Random(); }
+    int rnd_int(int max) {
+        return (int)(rnd.Random() % max);
+    }
 
-    double rnddouble() { return rnd.Random() * (1.0 / 4294967296.0); }
-    float rnd_float() { return (float)rnddouble(); } // FIXME: performance?
-    float rndfloatsigned() { return (float)(rnddouble() * 2 - 1); }
+    int rnd_int() {
+        return (int)rnd.Random();
+    }
+
+    int64_t rnd_int64(int64_t max) {
+        static_assert(sizeof(typename T::rnd_type) == 8);
+        return (int64_t)(rnd.Random() % max);
+    }
+
+    double rnd_double() {
+        static_assert(sizeof(typename T::rnd_type) == 8);
+        return (rnd.Random() >> 11) * 0x1.0p-53;
+    }
+
+    float rnd_float() {
+        return float(rnd_double());
+    }
+
+    float rnd_float_signed() {
+        return float(rnd_double() * 2 - 1);
+    }
 
     double n2 = 0.0;
     bool n2_cached = false;
@@ -287,8 +372,8 @@ template<typename T> struct RandomNumberGenerator {
         if (n2_cached) {
             double x, y, r;
             do {
-                x = 2.0 * rnddouble() - 1;
-                y = 2.0 * rnddouble() - 1;
+                x = 2.0 * rnd_double() - 1;
+                y = 2.0 * rnd_double() - 1;
                 r = x * x + y * y;
             } while (r == 0.0 || r > 1.0);
             double d = sqrt(-2.0 * log(r) / r);
@@ -684,6 +769,7 @@ range_wrapper<T> range(const T &end) {
 */
 
 // From: http://reedbeta.com/blog/python-like-enumerate-in-cpp17/
+// FIXME: doesn't work with T* types.
 
 template <typename T,
           typename TIter = decltype(std::begin(std::declval<T>())),
@@ -713,7 +799,7 @@ template<typename T> reversion_wrapper<T> reverse(T &&iterable) { return { itera
 
 // Stops a class from being accidental victim to default copy + destruct twice problem.
 
-class NonCopyable        {
+class NonCopyable {
     NonCopyable(const NonCopyable&) = delete;
     const NonCopyable& operator=(const NonCopyable&) = delete;
 
@@ -722,77 +808,6 @@ protected:
     //virtual ~NonCopyable() {}
 };
 
-// This turns a sequence of booleans (the current value, and the values it had before) into a
-// single number:
-//   0: "became false": false, but it was true before.
-//   1: "became true": true, but it was false before.
-//  >1: "still true": true, and was already true. Number indicates how many times it has been true
-//      in sequence.
-//  <0: "still false": false, and false before it. Negative number indicates how many times it has
-//      been false.
-// >=1: "true": currently true, regardless of history.
-// <=0: "false": currently false, regardless of history.
-
-// This is useful for detecting state changes and acting on them, such as for input device buttons.
-
-// T must be a signed integer type. Bigger types means more history before it clamps.
-
-// This is nicer than a bitfield, because basic checks like "became true" are simpler, it encodes
-// the history in a more human readable way, and it can encode a way longer history in the same
-// bits.
-template<typename T> class TimeBool {
-    T step;
-
-    enum {
-        SIGN_BIT = 1 << ((sizeof(T) * 8) - 1),
-        HIGHEST_VALUE_BIT = SIGN_BIT >> 1
-    };
-
-    // This encodes 2 booleans into 1 number.
-    static T Step(bool current, bool before) {
-        return T(current) * 2 - T(!before);
-    }
-
-    TimeBool(T _step) : step(_step) {}
-
-    public:
-
-    TimeBool() : step(-HIGHEST_VALUE_BIT) {}
-    TimeBool(bool current, bool before) : step(Step(current, before)) {}
-
-    bool True() { return step >= 1; }
-    bool False() { return step <= 0; }
-    bool BecameTrue() { return step == 1; }
-    bool BecameFalse() { return step == 0; }
-    bool StillTrue() { return step > 1; }
-    bool StillFalse() { return step < 0; }
-
-    T Step() { return step; }
-
-    T Sign() { return True() * 2 - 1; }
-
-    // This makes one time step, retaining the current value.
-    // It increases the counter, i.e. 2 -> 3 or -1 -> -2, indicating the amount of steps it has
-    // been true. Only allows this to increase to the largest power of 2 that fits inside T, e.g.
-    // 64 and -64 for a char.
-    void Advance() {
-        // Increase away from 0 if highest 2 bits are equal.
-        if ((step & HIGHEST_VALUE_BIT) == (step & SIGN_BIT))
-            step += Sign();
-    }
-
-    // Sets new value, assumes its different from the one before (wipes history).
-    void Set(bool newcurrent) { step = Step(newcurrent, True()); }
-    void Update(bool newcurrent) { Advance(); Set(newcurrent); }
-
-    // Previous state.
-    // This gives accurate history for the "still true/false" values, but for "became true/false"
-    // it assumes the history is "still false/true" as opposed to "became false/true" (which is
-    // also possible). This is typically desirable, and usually the difference doesn't matter.
-    TimeBool Back() { return TimeBool(step - Sign() * (step & ~1 ? 1 : HIGHEST_VALUE_BIT)); }
-};
-
-typedef TimeBool<char> TimeBool8;
 
 inline uint32_t FNV1A32(string_view s) {
     uint32_t hash = 0x811C9DC5;
@@ -811,6 +826,16 @@ inline uint64_t FNV1A64(string_view s) {
     }
     return hash;
 }
+
+// https://nullprogram.com/blog/2018/07/31/
+// See also SplitMix64 RNG above.
+inline uint64_t SplitMix64Hash(uint64_t x) {
+    x = (x ^ (x >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94D049BB133111EB);
+    return x ^ (x >> 31);
+}
+
+
 
 // dynamic_cast succeeds on both the given type and any derived types, which is frequently
 // undesirable. "is" only succeeds on the exact type given, and is cheaper. It also defaults
@@ -1006,16 +1031,50 @@ template<typename T> T ReadMem(const void *p) {
     return dest;
 }
 
-template<typename T> T ReadMemInc(const uint8_t *&p) {
-    T dest = ReadMem<T>(p);
-    p += sizeof(T);
-    return dest;
-}
-
 template<typename T> void WriteMemInc(uint8_t *&dest, const T &src) {
     memcpy(dest, &src, sizeof(T));
     dest += sizeof(T);
 }
+
+template<typename T> bool ReadSpan(const gsl::span<const uint8_t> p, T &v) {
+    if (p.size_bytes() < sizeof(T))
+        return false;
+    memcpy(&v, p.data(), sizeof(T));
+    return true;
+}
+
+template<typename T> bool ReadSpanInc(gsl::span<const uint8_t> &p, T &v) {
+    if (p.size_bytes() < sizeof(T))
+        return false;
+    memcpy(&v, p.data(), sizeof(T));
+    p = p.subspan(sizeof(T));
+    return true;
+}
+
+template<typename T, typename K = uint64_t> bool ReadSpanVec(gsl::span<const uint8_t> &p, T &v) {
+    K len;
+    if (!ReadSpanInc<K>(p, len))
+        return false;
+    auto blen = len * sizeof(typename T::value_type);
+    if (p.size_bytes() < blen)
+        return false;
+    v.resize((size_t)len);
+    memcpy(v.data(), p.data(), blen);
+    p = p.subspan(blen);
+    return true;
+}
+
+template<typename T, typename K = uint64_t> bool SkipSpanVec(gsl::span<const uint8_t> &p) {
+    K len;
+    if (!ReadSpanInc(p, len))
+        return false;
+    auto blen = len * sizeof(typename T::value_type);
+    if (p.size_bytes() < blen)
+        return false;
+    p = p.subspan(blen);
+    return true;
+}
+
 
 // Enum operators.
 

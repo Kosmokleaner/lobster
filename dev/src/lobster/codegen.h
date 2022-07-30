@@ -38,6 +38,7 @@ struct CodeGen  {
     vector<ILOP> tstack;
     size_t tstack_max = 0;
     int dummyfun = -1;
+    const SubFunction *cursf = nullptr;
 
     int Pos() { return (int)code.size(); }
 
@@ -123,9 +124,9 @@ struct CodeGen  {
 
     void PushFields(UDT *udt, vector<type_elem_t> &tt, type_elem_t parent = (type_elem_t)-1) {
         for (auto &field : udt->fields) {
-            auto ti = GetTypeTableOffset(field.resolvedtype);
-            if (IsStruct(field.resolvedtype->t)) {
-                PushFields(field.resolvedtype->udt, tt, ti);
+            auto ti = GetTypeTableOffset(field.resolvedtype());
+            if (IsStruct(field.resolvedtype()->t)) {
+                PushFields(field.resolved_udt(), tt, parent < 0 ? ti : parent);
             } else {
                 tt.insert(tt.begin() + (ssize(tt) - ti_num_udt_fields) / ti_num_udt_per_field +
                           ti_num_udt_fields, ti);
@@ -161,7 +162,10 @@ struct CodeGen  {
                 type_table.insert(type_table.end(), ttsize, (type_elem_t)0);
                 tt.push_back((type_elem_t)type->udt->idx);
                 tt.push_back((type_elem_t)type->udt->numslots);
-                tt.push_back((type_elem_t)type->udt->vtable_start);
+                if (type->t == V_CLASS)
+                    tt.push_back((type_elem_t)type->udt->vtable_start);
+                else
+                    tt.push_back((type_elem_t)ComputeBitMask(*type->udt, nullptr));
                 PushFields(type->udt, tt);
                 assert(ssize(tt) == ttsize);
                 std::copy(tt.begin(), tt.end(), type_table.begin() + type->udt->typeinfo);
@@ -199,7 +203,6 @@ struct CodeGen  {
                                                             GetTypeTableOffset(type_resource);
                                                             GetTypeTableOffset(type_any);
         Type type_valuebuf(V_VALUEBUF);                     GetTypeTableOffset(&type_valuebuf);
-        Type type_stackframebuf(V_STACKFRAMEBUF);           GetTypeTableOffset(&type_stackframebuf);
                                                             GetTypeTableOffset(type_vector_int);
                                                             GetTypeTableOffset(type_vector_float);
         Type type_vec_str(V_VECTOR, &*type_string);         GetTypeTableOffset(&type_vec_str);
@@ -300,8 +303,17 @@ struct CodeGen  {
         while (retval--) EmitOp(IL_PUSHNIL);
     }
 
+    void GenStatDebug(const Node *c) {
+        if (runtime_checks >= RUNTIME_ASSERT_PLUS) {
+            EmitOp(IL_STATEMENT);
+            Emit(c->line.line);
+            Emit(c->line.fileidx);
+        }
+    }
+
     void GenScope(SubFunction &sf) {
         if (sf.subbytecodestart > 0) return;
+        cursf = &sf;
         keepvars = 0;
         tstack_max = 0;
         sf.subbytecodestart = Pos();
@@ -328,9 +340,9 @@ struct CodeGen  {
                     Emit(arg.sid->Idx() + i);
                     nvars++;
                     if (ShouldDec(IsStruct(arg.sid->type->t)
-                                  ? TypeLT { FindSlot(*arg.sid->type->udt, i)->resolvedtype,
+                                      ? TypeLT{ FindSlot(*arg.sid->type->udt, i)->resolvedtype(),
                                              arg.sid->lt }
-                                  : TypeLT { *arg.sid }) && (!ir || arg.sid != ir->sid)) {
+                                      : TypeLT { *arg.sid }) && (!ir || arg.sid != ir->sid)) {
                         ownedvars.push_back(arg.sid->Idx() + i);
                     }
                 }
@@ -345,14 +357,23 @@ struct CodeGen  {
         // ownership of them.
         Emit((int)ownedvars.size());
         for (auto si : ownedvars) Emit(si);
-        if (sf.sbody) for (auto c : sf.sbody->children) {
-            Gen(c, 0);
-            if (runtime_checks >= RUNTIME_ASSERT_PLUS) {
-                EmitOp(IL_ENDSTATEMENT);
-                Emit(c->line.line);
-                Emit(c->line.fileidx);
-                assert(tstack.empty());
+        auto profile = sf.attributes.find("profile");
+        if (LOBSTER_FRAME_PROFILER && profile != sf.attributes.end()) {
+            EmitOp(IL_PROFILE);
+            auto str = string(profile->second);
+            if (str.empty()) {
+                str = sf.parent->name;
+                if (!sf.args.empty() && !sf.parent->overloads.empty()) {
+                    append(str, "(", TypeName(sf.args[0].type), (sf.args.size() > 1 ? ", .." : ""), ")");
+                }
             }
+            Emit((int)stringtable.size());
+            stringtable.push_back(st.StoreName(str));
+        }
+        if (sf.sbody) for (auto c : sf.sbody->children) {
+            GenStatDebug(c);
+            Gen(c, 0);
+            assert(tstack.empty());
         }
         else Dummy(sf.reqret);
         assert(temptypestack.empty());
@@ -361,6 +382,7 @@ struct CodeGen  {
         code[regspos] = (int)tstack_max;
         code[keepvarspos] = keepvars;
         linenumbernodes.pop_back();
+        cursf = nullptr;
     }
 
     // This must be called explicitly when any values are consumed.
@@ -380,24 +402,25 @@ struct CodeGen  {
         if (!code[pos]) call_fixups.push_back({ pos, sf });
     }
 
-    void GenUnwind(const SubFunction &sf, const SubFunction &sf_to, int nretslots_norm) {
+    void GenUnwind(const SubFunction &sf, int nretslots_unwind_max, int nretslots_norm) {
         // We're in an odd position here, because what is on the stack can either be from
         // the function we're calling (if we're not falling thru) or from any function above it
-        // with different number of return values.
+        // with different number of return values (and there can be multiple such paths, with
+        // different retvals, hence "max").
         // Then, below it, may be temps.
         // If we're falling thru, we actually want to 1) unwind, 2) copy rets, 3) pop temps
         // We manage the tstack as if we're not falling thru.
-        auto nretslots_unwind = ValWidthMulti(sf_to.returntype, sf_to.returntype->NumValues());
         // Need to ensure there's enough space for either path.
-        for (int i = nretslots_norm; i < nretslots_unwind; i++) PushTemp(IL_CALL);
+        for (int i = nretslots_norm; i < nretslots_unwind_max; i++)
+            PushTemp(IL_CALL);
         EmitOp(IL_JUMPIFUNWOUND);
         Emit(sf.parent->idx);
         Emit(0);
-        for (int i = nretslots_norm; i < nretslots_unwind; i++) PopTemp();
+        for (int i = nretslots_norm; i < nretslots_unwind_max; i++)
+            PopTemp();
         auto loc = Pos();
         auto tstackbackup = tstack;
         EmitOp(IL_RETURNANY);
-        Emit(nretslots_unwind);
         Emit(nretslots_norm);
         for (auto &tse : reverse(temptypestack)) {
             GenPop(tse);
@@ -426,8 +449,8 @@ struct CodeGen  {
             EmitOp(IL_CALL, inw, outw);
             Emit(sf.subbytecodestart);
             GenFixup(&sf);
-            if (sf.returned_thru_to) {
-                GenUnwind(sf, *sf.returned_thru_to, outw);
+            if (sf.returned_thru_to_max >= 0) {
+                GenUnwind(sf, sf.returned_thru_to_max, outw);
             }
         } else {
             EmitOp(IL_DDCALL, inw, outw);
@@ -439,9 +462,9 @@ struct CodeGen  {
             assert(IsUDT(dispatch_type->t));
             auto &de = dispatch_type->udt->dispatch[call.vtable_idx];
             assert(de.is_dispatch_root && !de.returntype.Null() && de.subudts_size);
-            if (de.returned_thru_to) {
+            if (de.returned_thru_to_max >= 0) {
                 // This works because all overloads of a DD sit under a single Function.
-                GenUnwind(sf, *de.returned_thru_to, outw);
+                GenUnwind(sf, de.returned_thru_to_max, outw);
             }
         }
         auto nretvals = sf.returntype->NumValues();
@@ -452,6 +475,13 @@ struct CodeGen  {
                 // FIXME: better if this is impossible by making sure typechecker makes it !reqret.
                 GenPop({ sf, i });
             }
+        }
+        for (size_t i = nretvals; i < retval; i++) {
+            // This can happen in a function that ends in a non-local return (thus nretvals==0)
+            // but retval>0 because it is inside an if-then-else branch.
+            // FIXME: take care of this in Gen() instead? Are there other nodes for which this
+            // can happen?
+            PushTemp(IL_EXIT);
         }
     };
 
@@ -476,8 +506,16 @@ struct CodeGen  {
 
     void GenPop(TypeLT typelt) {
         if (IsStruct(typelt.type->t)) {
-            EmitOp(typelt.type->t == V_STRUCT_R ? IL_POPVREF : IL_POPV, typelt.type->udt->numslots, 0);
-            Emit(typelt.type->udt->numslots);
+            if (typelt.type->t == V_STRUCT_R) {
+                // TODO: alternatively emit a single op with a list or bitmask? see EmitBitMaskForRefStuct
+                for (int j = typelt.type->udt->numslots - 1; j >= 0; j--) {
+                    EmitOp(IsRefNil(FindSlot(*typelt.type->udt, j)->resolvedtype()->t) ? IL_POPREF
+                                                                                     : IL_POP);
+                }
+            } else {
+                EmitOp(IL_POPV, typelt.type->udt->numslots, 0);
+                Emit(typelt.type->udt->numslots);
+            }
         } else {
             EmitOp(ShouldDec(typelt) ? IL_POPREF : IL_POP);
         }
@@ -533,6 +571,23 @@ struct CodeGen  {
         if (IsStruct(type->t)) Emit(ValWidth(type));
     }
 
+    int ComputeBitMask(const UDT &udt, const Node *errloc) {
+        int bits = 0;
+        for (int j = 0; j < udt.numslots; j++) {
+            if (IsRefNil(FindSlot(udt, j)->resolvedtype()->t)) {
+                if (j > 31)
+                    parser.ErrorAt(errloc, "internal error: struct with too many reference fields");
+                bits |= 1 << j;
+            }
+        }
+        return bits;
+    }
+
+    void EmitBitMaskForRefStuct(TypeRef type, const Node *errloc) {
+        assert(type->t == V_STRUCT_R);
+        Emit(ComputeBitMask(*type->udt, errloc));
+    }
+
     void GenValueWidth(TypeRef type) {
         // FIXME: struct variable size.
         EmitOp(IL_PUSHINT);
@@ -570,6 +625,7 @@ struct CodeGen  {
             if (!post) {
                 EmitOp(lvalop, ValWidth(lval->exptype));
                 EmitWidthIfStruct(lvt);
+                if (lvalop == IL_LV_WRITEREFV) EmitBitMaskForRefStuct(lvt, lval);
             }
             if (retval) {
                 // FIXME: it seems these never need a refcount increase because they're always
@@ -581,6 +637,7 @@ struct CodeGen  {
             if (post) {
                 EmitOp(lvalop, ValWidth(lval->exptype));
                 EmitWidthIfStruct(lvt);
+                if (lvalop == IL_LV_WRITEREFV) EmitBitMaskForRefStuct(lvt, lval);
             }
         };
         if (auto idr = Is<IdentRef>(lval)) {
@@ -597,7 +654,7 @@ struct CodeGen  {
             TakeTemp(take_temp + 1, true);
             EmitOp(IL_LVAL_FLD);
             Emit(field.slot);
-            GenLvalRet(field.resolvedtype);
+            GenLvalRet(field.resolvedtype());
         } else if (auto indexing = Is<Indexing>(lval)) {
             Gen(indexing->object, 1);
             Gen(indexing->index, 1);
@@ -917,7 +974,7 @@ void Dot::Generate(CodeGen &cg, size_t retval) const {
     assert(idx >= 0);
     auto &field = stype->udt->fields[idx];
     assert(field.slot >= 0);
-    cg.GenPushField(retval, child, stype, field.resolvedtype, field.slot);
+    cg.GenPushField(retval, child, stype, field.resolvedtype(), field.slot);
 }
 
 void Indexing::Generate(CodeGen &cg, size_t retval) const {
@@ -941,6 +998,9 @@ void AssignList::Generate(CodeGen &cg, size_t retval) const {
 }
 
 void Define::Generate(CodeGen &cg, size_t retval) const {
+    if (Is<DefaultVal>(child)) {
+        return;  // Pre-decl. 
+    }
     cg.Gen(child, sids.size());
     for (size_t i = sids.size(); i-- > 0; ) {
         auto sid = sids[i].first;
@@ -952,8 +1012,10 @@ void Define::Generate(CodeGen &cg, size_t retval) const {
         // We should emit a specialized opcode for these cases only.
         // NOTE: we already don't decref for borrowed vars generated by the optimizer here (!)
         cg.GenLvalVar(*sid);
-        cg.EmitOp(cg.AssignBaseOp({ *sid }), ValWidth(sid->type));
+        auto op = cg.AssignBaseOp({ *sid });
+        cg.EmitOp(op, ValWidth(sid->type));
         cg.EmitWidthIfStruct(sid->type);
+        if (op == IL_LV_WRITEREFV) cg.EmitBitMaskForRefStuct(sid->type, this);
     }
     assert(!retval);  // Parser guarantees this.
     (void)retval;
@@ -1080,7 +1142,7 @@ void ToBool::Generate(CodeGen &cg, size_t retval) const {
     cg.Gen(child, retval);
     if (!retval) return;
     cg.TakeTemp(1, false);
-    cg.EmitOp(IsRefNil(child->exptype->t) ? IL_E2BREF : IL_E2B);
+    cg.EmitOp(cg.ShouldDec(TypeLT(*child, 0)) ? IL_E2BREF : IL_E2B);
 }
 
 void ToInt::Generate(CodeGen &cg, size_t retval) const {
@@ -1102,11 +1164,11 @@ void ToLifetime::Generate(CodeGen &cg, size_t retval) const {
             if (incref & (1LL << i)) {
                 assert(IsRefNil(type->t));
                 if (type->t == V_STRUCT_R) {
-                    // TODO: alternatively emit a single op with a list or bitmask?
+                    // TODO: alternatively emit a single op with a list or bitmask? see EmitBitMaskForRefStuct
                     for (int j = 0; j < type->udt->numslots; j++) {
-                        if (IsRefNil(FindSlot(*type->udt, j)->resolvedtype->t)) {
+                        if (IsRefNil(FindSlot(*type->udt, j)->resolvedtype()->t)) {
                             cg.EmitOp(IL_INCREF);
-                            cg.Emit(stack_offset + j);
+                            cg.Emit(stack_offset + type->udt->numslots - 1 - j);
                         }
                     }
                 } else {
@@ -1117,9 +1179,9 @@ void ToLifetime::Generate(CodeGen &cg, size_t retval) const {
             if (decref & (1LL << i)) {
                 assert(IsRefNil(type->t));
                 if (type->t == V_STRUCT_R) {
-                    // TODO: alternatively emit a single op with a list or bitmask?
+                    // TODO: alternatively emit a single op with a list or bitmask? see EmitBitMaskForRefStuct
                     for (int j = 0; j < type->udt->numslots; j++) {
-                        if (IsRefNil(FindSlot(*type->udt, j)->resolvedtype->t))
+                        if (IsRefNil(FindSlot(*type->udt, j)->resolvedtype()->t))
                             cg.EmitKeep(stack_offset + j, 0);
                     }
                 } else {
@@ -1253,6 +1315,7 @@ void Block::Generate(CodeGen &cg, size_t retval) const {
     auto tstack_start = cg.tstack.size();
     (void)tstack_start;
     for (auto c : children) {
+        cg.GenStatDebug(c);
         if (c != children.back()) {
             // Not the last element.
             cg.Gen(c, 0);
@@ -1429,12 +1492,14 @@ void ForLoopElem::Generate(CodeGen &cg, size_t /*retval*/) const {
         case V_STRING:
             cg.EmitOp(IL_SFORELEM);
             break;
-        case V_VECTOR:
-            cg.EmitOp(IsRefNil(typelt.type->sub->t)
-                    ? (IsStruct(typelt.type->sub->t) ? IL_VFORELEMREF2S : IL_VFORELEMREF)
-                    : (IsStruct(typelt.type->sub->t) ? IL_VFORELEM2S : IL_VFORELEM),
-                2, ValWidth(typelt.type->sub) + 2);
+        case V_VECTOR: {
+            auto op = IsRefNil(typelt.type->sub->t)
+                          ? (IsStruct(typelt.type->sub->t) ? IL_VFORELEMREF2S : IL_VFORELEMREF)
+                          : (IsStruct(typelt.type->sub->t) ? IL_VFORELEM2S : IL_VFORELEM);
+            cg.EmitOp(op, 2, ValWidth(typelt.type->sub) + 2);
+            if (op == IL_VFORELEMREF2S) cg.EmitBitMaskForRefStuct(typelt.type->sub, this);
             break;
+        }
         default:
             assert(false);
     }
@@ -1665,7 +1730,7 @@ void IsType::Generate(CodeGen &cg, size_t retval) const {
     if (retval) {
         cg.TakeTemp(1, false);
         cg.EmitOp(IL_ISTYPE);
-        cg.Emit(cg.GetTypeTableOffset(resolvedtype));
+        cg.Emit(cg.GetTypeTableOffset(gr.resolvedtype()));
     }
 }
 
@@ -1708,29 +1773,28 @@ void Return::Generate(CodeGen &cg, size_t retval) const {
     // of the functions in between here and the function returned to.
     // Actually, doesn't work with DDCALL and RETURN_THRU.
     // FIXME: shouldn't need any type here if V_VOID, but nretvals is at least 1 ?
-    cg.EmitOp(IL_RETURN, nretslots);
-    cg.Emit(sf->parent->idx);
-    cg.Emit(nretslots);
+    if (sf == cg.cursf && sf->returned_thru_to_max < 0) {
+        cg.EmitOp(IL_RETURNLOCAL, nretslots);
+        cg.Emit(nretslots);
+    } else {
+        // This is for both if the return itself is non-local, or if the destination has
+        // an unwind check, could potentially split those up further.
+        cg.EmitOp(IL_RETURNNONLOCAL, nretslots);
+        cg.Emit(nretslots);
+        cg.Emit(sf->parent->idx);
+    }
+
     cg.temptypestack = typestackbackup;
     cg.tstack = tstackbackup;
     // We can promise to be providing whatever retvals the caller wants.
     for (size_t i = 0; i < retval; i++) {
         cg.rettypes.push_back({ type_undefined, LT_ANY });
+        cg.PushTemp(IL_RETURNLOCAL);  // FIXME: is this necessary? do more generally?
     }
 }
 
 void TypeOf::Generate(CodeGen &cg, size_t /*retval*/) const {
-    if (auto dv = Is<DefaultVal>(child)) {
-        if (cg.node_context.size() >= 2) {
-            auto parent = cg.node_context[cg.node_context.size() - 2];
-            if (Is<NativeCall>(parent)) {
-                cg.EmitOp(IL_PUSHINT);
-                cg.Emit(cg.GetTypeTableOffset(parent->exptype));
-                return;
-            }
-        }
-        cg.parser.ErrorAt(dv, "typeof return out of call context");
-    } else  if (auto idr = Is<IdentRef>(child)) {
+    if (auto idr = Is<IdentRef>(child)) {
         cg.EmitOp(IL_PUSHINT);
         cg.Emit(cg.GetTypeTableOffset(idr->exptype));
     } else {

@@ -16,6 +16,8 @@
 //
 #include "lobster/stdafx.h"
 
+#include "lobster/il.h"
+
 #include "lobster/lex.h"
 #include "lobster/idents.h"
 #include "lobster/node.h"
@@ -42,7 +44,6 @@ const Type g_type_function_null(V_FUNCTION);
 const Type g_type_resource(V_RESOURCE);
 const Type g_type_vector_resource(V_VECTOR, &g_type_resource);
 const Type g_type_typeid(V_TYPEID, &g_type_any);
-const Type g_type_typeid_vec(V_TYPEID, &g_type_vector_any);
 const Type g_type_void(V_VOID);
 const Type g_type_undefined(V_UNDEFINED);
 
@@ -56,7 +57,6 @@ TypeRef type_function_null = &g_type_function_null;
 TypeRef type_resource = &g_type_resource;
 TypeRef type_vector_resource = &g_type_vector_resource;
 TypeRef type_typeid = &g_type_typeid;
-TypeRef type_typeid_vec = &g_type_typeid_vec;
 TypeRef type_void = &g_type_void;
 TypeRef type_undefined = &g_type_undefined;
 
@@ -65,6 +65,8 @@ const Type g_type_vector_vector_int(V_VECTOR, &g_type_vector_int);
 const Type g_type_vector_vector_float(V_VECTOR, &g_type_vector_float);
 const Type g_type_vector_vector_vector_float(V_VECTOR, &g_type_vector_vector_float);
 
+ResourceType *g_resource_type_list = nullptr;
+
 TypeRef WrapKnown(TypeRef elem, ValueType with) {
     if (with == V_VECTOR) {
         switch (elem->t) {
@@ -72,7 +74,7 @@ TypeRef WrapKnown(TypeRef elem, ValueType with) {
             case V_INT:      return elem->e ? nullptr : type_vector_int;
             case V_FLOAT:    return type_vector_float;
             case V_STRING:   return &g_type_vector_string;
-            case V_RESOURCE: return &g_type_vector_resource;
+            case V_RESOURCE: return &elem->rt->thistypevec;
             case V_VECTOR:   switch (elem->sub->t) {
                 case V_INT:    return elem->sub->e ? nullptr : &g_type_vector_vector_int;
                 case V_FLOAT:  return &g_type_vector_vector_float;
@@ -91,7 +93,7 @@ TypeRef WrapKnown(TypeRef elem, ValueType with) {
             case V_FLOAT:     { static const Type t(V_NIL, &g_type_float); return &t; }
             case V_STRING:    { static const Type t(V_NIL, &g_type_string); return &t; }
             case V_FUNCTION:  { static const Type t(V_NIL, &g_type_function_null); return &t; }
-            case V_RESOURCE:  { static const Type t(V_NIL, &g_type_resource); return &t; }
+            case V_RESOURCE:  { return &elem->rt->thistypenil; }
             case V_VECTOR: switch (elem->sub->t) {
                 case V_INT:    { static const Type t(V_NIL, &g_type_vector_int); return elem->sub->e ? nullptr : &t; }
                 case V_FLOAT:  { static const Type t(V_NIL, &g_type_vector_float); return &t; }
@@ -250,6 +252,19 @@ void DumpBuiltinNames(NativeRegistry &nfr) {
     WriteFile("builtin_functions_names.txt", false, s);
 }
 
+string HTMLEscape(string_view in) {
+    string s;
+    for (auto c : in) {
+        switch (c) {
+            case '&': s += "&amp;"; break;
+            case '<': s += "&lt;"; break;
+            case '>': s += "&gt;"; break;
+            default: s += c; break;
+        }
+    }
+    return s;
+}
+
 void DumpBuiltinDoc(NativeRegistry &nfr) {
     string s =
         "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n"
@@ -289,7 +304,7 @@ void DumpBuiltinDoc(NativeRegistry &nfr) {
                 s += ":";
                 s += a.flags & NF_BOOL
                     ? "bool"
-                    : TypeName(a.type->ElementIfNil(), a.fixed_len);
+                    : HTMLEscape(TypeName(a.type->ElementIfNil(), a.fixed_len));
             }
             s += "</font>";
             if (a.type->t == V_NIL && (int)i > last_non_nil)
@@ -300,27 +315,26 @@ void DumpBuiltinDoc(NativeRegistry &nfr) {
             s += " -> ";
             for (auto [i, a] : enumerate(nf->retvals)) {
                 s += "<font color=\"#666666\">";
-                s += TypeName(a.type, a.fixed_len);
+                s += HTMLEscape(TypeName(a.type, a.fixed_len));
                 s += "</font>";
                 if (i < nf->retvals.size() - 1) s += ", ";
             }
         }
-        s += cat("</tt></td><td class=\"a\">", nf->help, "</td></tr>\n");
+        s += cat("</tt></td><td class=\"a\">", HTMLEscape(nf->help), "</td></tr>\n");
     }
     s += "</table>\n</td></tr></table></center></body>\n</html>\n";
     WriteFile("builtin_functions_reference.html", false, s);
 }
 
 void Compile(NativeRegistry &nfr, string_view fn, string_view stringsource, string &bytecode,
-    string *parsedump, string *pakfile, bool return_value,
-    int runtime_checks) {
+             string *parsedump, string *pakfile, bool return_value, int runtime_checks) {
     SymbolTable st;
     Parser parser(nfr, fn, st, stringsource);
     parser.Parse();
     TypeChecker tc(parser, st, return_value);
     // Optimizer is not optional, must always run, since TypeChecker and CodeGen
     // rely on it culling const if-thens and other things.
-    Optimizer opt(parser, st, tc);
+    Optimizer opt(parser, st, tc, runtime_checks);
     if (parsedump) *parsedump = parser.DumpAll(true);
     CodeGen cg(parser, st, return_value, runtime_checks);
     st.Serialize(cg.code, cg.type_table,
@@ -333,9 +347,9 @@ void Compile(NativeRegistry &nfr, string_view fn, string_view stringsource, stri
 
 string RunTCC(NativeRegistry &nfr, string_view bytecode_buffer, string_view fn,
               const char *object_name, vector<string> &&program_args, TraceMode trace,
-              bool compile_only, string &error) {
+              bool compile_only, string &error, int runtime_checks, bool dump_leaks) {
     string sd;
-    error = ToCPP(nfr, sd, bytecode_buffer, false);
+    error = ToCPP(nfr, sd, bytecode_buffer, false, runtime_checks);
     if (!error.empty()) return "";
     #if VM_JIT_MODE
         const char *export_names[] = { "compiled_entry_point", "vtables", nullptr };
@@ -346,9 +360,10 @@ string RunTCC(NativeRegistry &nfr, string_view bytecode_buffer, string_view fn,
                 LOG_INFO("time to tcc (seconds): ", SecondsSinceStart() - start_time);
                 if (compile_only) return true;
                 auto vmargs = VMArgs {
-                    nfr, fn, (uint8_t *)bytecode_buffer.data(),
+                    nfr, string(fn), (uint8_t *)bytecode_buffer.data(),
                     bytecode_buffer.size(), std::move(program_args),
-                    (fun_base_t *)exports[1], (fun_base_t)exports[0], trace
+                    (fun_base_t *)exports[1], (fun_base_t)exports[0], trace, dump_leaks,
+                    runtime_checks
                 };
                 lobster::VMAllocator vma(std::move(vmargs));
                 vma.vm->EvalProgram();
@@ -385,12 +400,13 @@ Value CompileRun(VM &parent_vm, StackPtr &parent_sp, Value &source, bool stringi
     try
     #endif
     {
+        int runtime_checks = RUNTIME_ASSERT;  // FIXME: let caller decide?
         string bytecode_buffer;
         Compile(parent_vm.nfr, fn, stringiscode ? source.sval()->strv() : string_view(),
-                bytecode_buffer, nullptr, nullptr, true, RUNTIME_ASSERT);
+                bytecode_buffer, nullptr, nullptr, true, runtime_checks);
         string error;
         auto ret = RunTCC(parent_vm.nfr, bytecode_buffer, fn, nullptr, std::move(args),
-                          TraceMode::OFF, false, error);
+                          TraceMode::OFF, false, error, runtime_checks, true);
         if (!error.empty()) THROW_OR_ABORT(error);
         Push(parent_sp, Value(parent_vm.NewString(ret)));
         return NilVal();
@@ -418,7 +434,7 @@ nfr("compile_run_code", "code,args", "SS]", "SS?",
 nfr("compile_run_file", "filename,args", "SS]", "SS?",
     "same as compile_run_code(), only now you pass a filename.",
     [](StackPtr &sp, VM &vm, Value &filename, Value &args) {
-        return CompileRun(vm, sp, filename, false, ValueToVectorOfStrings( args));
+        return CompileRun(vm, sp, filename, false, ValueToVectorOfStrings(args));
     });
 
 }
@@ -431,7 +447,8 @@ void RegisterCoreLanguageBuiltins(NativeRegistry &nfr) {
 }
 
 #if !LOBSTER_ENGINE
-FileLoader EnginePreInit(NativeRegistry &) {
+FileLoader EnginePreInit(NativeRegistry &nfr) {
+    nfr.DoneRegistering();
     return DefaultLoadFile;
 }
 #endif
@@ -449,7 +466,7 @@ extern "C" int RunCompiledCodeMain(int argc, const char * const *argv, const uin
         InitPlatform("../../", "", false, loader);  // FIXME: path.
         auto vmargs = VMArgs {
             nfr, StripDirPart(argv[0]), bytecodefb, static_size, {},
-            vtables, nullptr, TraceMode::OFF
+            vtables, nullptr, TraceMode::OFF, false, RUNTIME_ASSERT
         };
         for (int arg = 1; arg < argc; arg++) { vmargs.program_args.push_back(argv[arg]); }
         lobster::VMAllocator vma(std::move(vmargs));
@@ -469,7 +486,7 @@ SubFunction::~SubFunction() { if (sbody) delete sbody; }
 Field::~Field() { delete defaultval; }
 
 Field::Field(const Field &o)
-    : giventype(o.giventype), resolvedtype(o.resolvedtype), id(o.id),
+    : GivenResolve(o), id(o.id),
       defaultval(o.defaultval ? o.defaultval->Clone() : nullptr), isprivate(o.isprivate),
       defined_in(o.defined_in) {}
 

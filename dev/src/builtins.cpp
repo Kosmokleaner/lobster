@@ -20,7 +20,8 @@
 
 namespace lobster {
 
-static RandomNumberGenerator<MersenneTwister> rnd;
+static RandomNumberGenerator<MersenneTwister> rndm;
+static RandomNumberGenerator<Xoshiro256SS> rndx;
 
 static int IntCompare(const Value &a, const Value &b) {
     return a.ival() < b.ival() ? -1 : a.ival() > b.ival();
@@ -157,12 +158,14 @@ nfr("append_into", "dest,src", "A]*A]1c", "Ab]1",
         return v1;
     });
 
-nfr("vector_reserve", "typeid,len", "VI", "A]*",
-    "creates a new empty vector much like [] would, except now ensures"
-    " it will have space for len push() operations without having to reallocate."
-    " pass \"typeof return\" as typeid.",
-    [](StackPtr &, VM &vm, Value &type, Value &len) {
-        return Value(vm.NewVec(0, len.ival(), (type_elem_t)type.ival()));
+nfr("vector_capacity", "xs,len", "A]*I", "Ab]1",
+    "ensures the vector capacity (number of elements it can contain before re-allocating)"
+    " is at least \"len\". Does not actually add (or remove) elements. This function is"
+    " just for efficiency in the case the amount of \"push\" operations is known."
+    " returns original vector.",
+    [](StackPtr &, VM &vm, Value &vec, Value &len) {
+        vec.vval()->MinCapacity(vm, len.ival());
+        return vec;
     });
 
 nfr("length", "x", "I", "I",
@@ -323,7 +326,7 @@ nfr("slice", "xs,start,size", "A]*II", "A]1",
     });
 
 nfr("any", "xs", "A]*", "B",
-    "returns wether any elements of the vector are true values",
+    "returns whether any elements of the vector are true values",
     [](StackPtr &, VM &, Value &v) {
         Value r(false);
         iint l = v.vval()->len;
@@ -334,7 +337,7 @@ nfr("any", "xs", "A]*", "B",
     });
 
 nfr("any", "xs", "I}", "B",
-    "returns wether any elements of the numeric struct are true values",
+    "returns whether any elements of the numeric struct are true values",
     [](StackPtr &sp, VM &) {
         auto r = false;
         auto l = Pop(sp).ival();
@@ -345,7 +348,7 @@ nfr("any", "xs", "I}", "B",
     });
 
 nfr("all", "xs", "A]*", "B",
-    "returns wether all elements of the vector are true values",
+    "returns whether all elements of the vector are true values",
     [](StackPtr &, VM &, Value &v) {
         Value r(true);
         for (iint i = 0; i < v.vval()->len; i++) {
@@ -355,7 +358,7 @@ nfr("all", "xs", "A]*", "B",
     });
 
 nfr("all", "xs", "I}", "B",
-    "returns wether all elements of the numeric struct are true values",
+    "returns whether all elements of the numeric struct are true values",
     [](StackPtr &sp, VM &) {
         auto r = true;
         auto l = Pop(sp).ival();
@@ -372,7 +375,7 @@ nfr("substring", "s,start,size", "SII", "S",
         iint size = e.ival();
         iint start = s.ival();
         if (size < 0) size = l.sval()->len - start;
-        if (start < 0 || start + size > l.sval()->len)
+        if (start < 0 || size < 0 || start + size > l.sval()->len)
             vm.BuiltinError("substring: values out of range");
 
         auto ns = vm.NewString(string_view(l.sval()->data() + start, (size_t)size));
@@ -442,30 +445,37 @@ nfr("string_to_int", "s,base", "SI?", "IB",
         return Value(end == sv.data() + sv.size());
     });
 
-nfr("string_to_float", "s", "S", "F",
-    "converts a string to a float. returns 0.0 if no numeric data could be parsed",
-    [](StackPtr &, VM &, Value &s) {
-        auto f = strtod(s.sval()->data(), nullptr);
-        return Value(f);
+nfr("string_to_float", "s", "S", "FB",
+    "converts a string to a float. returns 0.0 if no numeric data could be parsed;"
+    "second return value is true if all characters of the string were parsed.",
+    [](StackPtr &sp, VM &, Value &s) {
+        char *end;
+        auto sv = s.sval()->strv();
+        auto f = strtod(sv.data(), &end);
+        Push(sp, f);
+        return Value(end == sv.data() + sv.size());
     });
 
-nfr("tokenize", "s,delimiters,whitespace", "SSS", "S]",
+nfr("tokenize", "s,delimiters,whitespace,dividing", "SSSI?", "S]",
     "splits a string into a vector of strings, by splitting into segments upon each dividing or"
     " terminating delimiter. Segments are stripped of leading and trailing whitespace."
-    " Example: \"; A ; B C; \" becomes [ \"\", \"A\", \"B C\" ] with \";\" as delimiter and"
-    " \" \" as whitespace.",
-    [](StackPtr &, VM &vm, Value &s, Value &delims, Value &whitespace) {
+    " Example: \"; A ; B C;; \" becomes [ \"\", \"A\", \"B C\", \"\" ] with \";\" as delimiter and"
+    " \" \" as whitespace. If dividing was true, there would be a 5th empty string element.",
+    [](StackPtr &, VM &vm, Value &s, Value &delims, Value &whitespace, Value &dividing) {
         auto v = (LVector *)vm.NewVec(0, 0, TYPE_ELEM_VECTOR_OF_STRING);
         auto ws = whitespace.sval()->strv();
         auto dl = delims.sval()->strv();
         auto p = s.sval()->strv();
         p.remove_prefix(std::min(p.find_first_not_of(ws), p.size()));
-        while (!p.empty()) {
+        bool has_delim = false;
+        while (!p.empty() || (has_delim && dividing.True())) {
             auto delim = std::min(p.find_first_of(dl), p.size());
-            auto end = std::min(p.find_last_not_of(ws) + 1, delim);
+            auto delimstr = p.substr(0, delim);
+            auto end = std::min(delimstr.find_last_not_of(ws) + 1, delim);
             v->Push(vm, vm.NewString(string_view(p.data(), end)));
             p.remove_prefix(delim);
-            p.remove_prefix(std::min(p.find_first_not_of(dl), p.size()));
+            has_delim = std::min(p.find_first_not_of(dl), p.size()) != 0;
+            if (has_delim) p.remove_prefix(1);
             p.remove_prefix(std::min(p.find_first_not_of(ws), p.size()));
         }
         return Value(v);
@@ -743,6 +753,20 @@ nfr("magnitude", "v", "F}", "F",
         Push(sp, a.length());
     });
 
+nfr("magnitude_squared", "v", "F}", "F",
+    "the geometric length of a vector squared",
+    [](StackPtr &sp, VM &) {
+        auto a = DangleVec<double>(sp);
+        Push(sp, a.length_squared());
+    });
+
+nfr("magnitude_squared", "v", "I}", "I",
+    "the geometric length of a vector squared",
+    [](StackPtr &sp, VM &) {
+        auto a = DangleVec<iint>(sp);
+        Push(sp, a.length_squared());
+    });
+
 nfr("manhattan", "v", "I}", "I",
     "the manhattan distance of a vector",
     [](StackPtr &sp, VM &) {
@@ -758,21 +782,41 @@ nfr("cross", "a,b", "F}:3F}:3", "F}:3",
         PushVec(sp, cross(a, b));
     });
 
+nfr("volume", "v", "F}", "F", "the volume of the area spanned by the vector",
+    [](StackPtr &sp, VM &) {
+        auto a = DangleVec<double>(sp);
+        Push(sp, a.volume());
+    });
+
+nfr("volume", "v", "I}", "I", "the volume of the area spanned by the vector",
+    [](StackPtr &sp, VM &) {
+        auto a = DangleVec<iint>(sp);
+        Push(sp, a.volume());
+    });
+
 nfr("rnd", "max", "I", "I",
     "a random value [0..max).",
-    [](StackPtr &, VM &, Value &a) { return Value(rnd(std::max(1, (int)a.ival()))); });
+    [](StackPtr &, VM &, Value &a) { return Value(rndx.rnd_int64(std::max((iint)1, a.ival()))); });
 nfr("rnd", "max", "I}", "I}",
     "a random vector within the range of an input vector.",
-    [](StackPtr &sp, VM &) { VECTOROP(rnd(std::max(1, (int)f.ival()))); });
+    [](StackPtr &sp, VM &) { VECTOROP(rndx.rnd_int64(std::max((iint)1, f.ival()))); });
 nfr("rnd_float", "", "", "F",
     "a random float [0..1)",
-    [](StackPtr &, VM &) { return Value(rnd.rnddouble()); });
+    [](StackPtr &, VM &) { return Value(rndx.rnd_double()); });
 nfr("rnd_gaussian", "", "", "F",
     "a random float in a gaussian distribution with mean 0 and stddev 1",
-    [](StackPtr &, VM &) { return Value(rnd.rnd_gaussian()); });
+    [](StackPtr &, VM &) { return Value(rndx.rnd_gaussian()); });
 nfr("rnd_seed", "seed", "I", "",
     "explicitly set a random seed for reproducable randomness",
-    [](StackPtr &, VM &, Value &seed) { rnd.seed((int)seed.ival()); return NilVal(); });
+    [](StackPtr &, VM &, Value &seed) { rndx.seed(seed.ival()); return NilVal(); });
+
+
+nfr("rndm", "max", "I", "I",
+    "deprecated: old mersenne twister version of the above for backwards compat.",
+    [](StackPtr &, VM &, Value &a) { return Value(rndm.rnd_int(std::max(1, (int)a.ival()))); });
+nfr("rndm_seed", "seed", "I", "",
+    "deprecated: old mersenne twister version of the above for backwards compat.",
+    [](StackPtr &, VM &, Value &seed) { rndm.seed((int)seed.ival()); return NilVal(); });
 
 nfr("div", "a,b", "II", "F",
     "forces two ints to be divided as floats",
@@ -1140,7 +1184,7 @@ nfr("wave_function_collapse", "tilemap,size", "S]I}:2", "S]I",
         for (int i = 0; i < sz.y; i++) outmap[i] = (char *)outstrings.vval()->At(i).sval()->data();
         int num_contradictions = 0;
         auto ok = WaveFunctionCollapse(int2(iint2(cols, ssize(inmap))), inmap.data(), sz, outmap.data(),
-                                        rnd, num_contradictions);
+                                       rndx, num_contradictions);
         if (!ok)
             vm.BuiltinError("tilemap contained too many tile ids");
         Push(sp,  outstrings);
@@ -1175,13 +1219,13 @@ nfr("hash", "v", "I}", "I",
     "hashes a int vector into a positive int",
     [](StackPtr &sp, VM &vm) {
         auto a = DangleVec<iint>(sp);
-        Push(sp, positive_bits(a.hash(vm, V_INT)));
+        Push(sp, positive_bits(a.Hash(vm, V_INT)));
     });
 nfr("hash", "v", "F}", "I",
     "hashes a float vector into a positive int",
     [](StackPtr &sp, VM &vm) {
         auto a = DangleVec<double>(sp);
-        Push(sp, positive_bits(a.hash(vm, V_FLOAT)));
+        Push(sp, positive_bits(a.Hash(vm, V_FLOAT)));
     });
 
 nfr("program_name", "", "", "S",
@@ -1240,10 +1284,26 @@ nfr("date_time_string", "utc", "B?", "S",
     });
 
 nfr("assert", "condition", "A*", "Ab1",
-    "halts the program with an assertion failure if passed false. returns its input",
-    [](StackPtr &, VM &vm, Value &c) {
-        if (c.False()) vm.BuiltinError("assertion failed");
+    "halts the program with an assertion failure if passed false. returns its input."
+    " runtime errors like this will contain a stack trace if --runtime-verbose is on.",
+    [](StackPtr &, VM &, Value &c) {
+        assert(false);  // This builtin implemented as IL_ASSERT.
         return c;
+    });
+
+nfr("get_stack_trace", "", "", "S",
+    "gets a stack trace of the current location of the program (needs --runtime-verbose)"
+    " without actually stopping the program.",
+    [](StackPtr &, VM &vm) {
+        string sd;
+        vm.DumpStackTrace(sd);
+        return Value(vm.NewString(sd));
+    });
+
+nfr("get_memory_usage", "n", "I", "S",
+    "gets a text showing the top n object types that are using the most memory.",
+    [](StackPtr &, VM &vm, Value &n) {
+        return Value(vm.NewString(vm.MemoryUsage(n.intval())));
     });
 
 nfr("pass", "", "", "",
@@ -1288,7 +1348,7 @@ nfr("thread_information", "", "", "II",
     });
 
 nfr("is_worker_thread", "", "", "B",
-    "wether the current thread is a worker thread",
+    "whether the current thread is a worker thread",
     [](StackPtr &, VM &vm) {
         return Value(vm.is_worker);
     });
@@ -1310,7 +1370,7 @@ nfr("stop_worker_threads", "", "", "",
     });
 
 nfr("workers_alive", "", "", "B",
-    "wether workers should continue doing work. returns false after"
+    "whether workers should continue doing work. returns false after"
             " stop_worker_threads() has been called.",
     [](StackPtr &, VM &vm) {
         return Value(vm.tuple_space && vm.tuple_space->alive);

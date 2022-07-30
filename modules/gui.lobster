@@ -205,7 +205,7 @@ private def around(m, draw, id, f):
             position(size): // FIXME: clean this up
                 gl_rect(xy_f{ size.x, m.y })
                 gl_rect(xy_f { m.x, size.y })
-                gl_translate xy_f { size.x - m.x, 0 }:
+                gl_translate xy_f { size.x - m.x, 0.0 }:
                     gl_rect(xy_f { m.x, size.y })
                 gl_translate xy_f { 0.0, size.y - m.y }:
                     gl_rect(xy_f { size.x, m.y })
@@ -243,69 +243,69 @@ def key(key_name, f):  // Surround a button with this to also allow keyboard act
     f()
     button_key.pop()
 
-private def button(id, render, do, dofocus:bool, focusf):
+private def btn(id, render, do, dofocus:bool, focusf):
     overlay(false, id, render) size:
         if interactive.top:
             let hit = gl_hit(float(size), 0)
-            let key = gl_button(button_key.top)
-            let active = hit or key >= 0
+            let keydown, keyup = gl_button(button_key.top)
+            let active = hit or keydown or keyup == 1
             if active or (focus_id == id and gl_touchscreen()):
                 // Use the hover color both for mouse-hover, and touch screen buttons that have focus.
                 gl_color hover_color:
                     gl_rect(float(size))
                 if active:
                     num_interactive_elements_hit++
-                    let mouse1 = gl_button("mouse1")
-                    if mouse1 >= 1 or key >= 1:
+                    let mouse1down, mouse1up = gl_button("mouse1")
+                    if mouse1down or keydown:
                         gl_color(select_color):
                             gl_rect(float(size))
-                    if dofocus and focus_id != id and (mouse1 == 0 or not gl_touchscreen()):
+                    if dofocus and focus_id != id and (mouse1up == 1 or not gl_touchscreen()):
                         // If we have a focus action and this button wasn't the focus, then on a touch screen
                         // we're going to give this button focus on touch, and on desktop merely on hover.
                         focus_id = id
                         focusf()
-                    elif mouse1 == 0 or key == 0:
+                    elif mouse1up == 1 or keyup == 1:
                         if actionsfxr: play_sfxr(actionsfxr)
                         elif actionwav: play_wav(actionwav)
                         do()
 
 def button(f:fun, do:fun):
-    button(hash(f), f, do, false): nil
+    btn(hash(f), f, do, false): nil
 
 def button(f:fun, do:fun, focus:fun):
-    button(hash(f), f, do, true, focus)
+    btn(hash(f), f, do, true, focus)
 
 def button_id(id:int, f:fun, do:fun):
-    button(id, f, do, false): nil
+    btn(id, f, do, false): nil
 
 def button_id(id:int, f:fun, do:fun, focus:fun):
-    button(id, f, do, true, focus)
+    btn(id, f, do, true, focus)
 
 def button_text(msg:string, do:fun):
-    button(hash(msg), fn: text(msg), do, false): nil
+    btn(hash(msg), fn: text(msg), do, false): nil
 
 def button_id_text(id:int, msg:string, do:fun):
-    button(id, fn: text(msg), do, false): nil
+    btn(id, fn: text(msg), do, false): nil
 
 def button_id_text(id:int, msg:string, do:fun, focus:fun):
-    button(id, fn: text(msg), do, true, focus)
+    btn(id, fn: text(msg), do, true, focus)
 
 def button_text_color(msg:string, col:color, do:fun):
     color(col):
-        button(hash(msg), fn: text(msg), do, false): nil
+        btn(hash(msg), fn: text(msg), do, false): nil
 
 def button_image(size, tex, do:fun):
-    button(hash(tex), fn: image(size, tex), do, false): nil
+    btn(hash(tex), fn: image(size, tex), do, false): nil
 
 def button_id_image(id:int, size, tex, do:fun):
-    button(id, fn: image(size, tex), do, false): nil
+    btn(id, fn: image(size, tex), do, false): nil
 
 def button_id_image(id:int, size, tex, do:fun, focus:fun):
-    button(id, fn: image(size, tex), do, true, focus)
+    btn(id, fn: image(size, tex), do, true, focus)
 
 def button_image_color(size, tex, col:color, do:fun):
     color(col):
-        button(hash(tex), fn: image(size, tex), do, false): nil
+        btn(hash(tex), fn: image(size, tex), do, false): nil
 
 def custombackground(f:funs): if render_pass: f(overalsize)
 

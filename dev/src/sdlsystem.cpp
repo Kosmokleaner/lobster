@@ -14,6 +14,8 @@
 
 #include "lobster/stdafx.h"
 
+#include "lobster/vmdata.h"
+
 #include "lobster/sdlincludes.h"
 #include "lobster/sdlinterface.h"
 
@@ -36,6 +38,9 @@
 SDL_Window *_sdl_window = nullptr;
 SDL_GLContext _sdl_context = nullptr;
 
+SDL_Window *_sdl_debugger_window = nullptr;
+SDL_GLContext _sdl_debugger_context = nullptr;
+
 
 /*
 // FIXME: document this, especially the ones containing spaces.
@@ -53,20 +58,50 @@ right meta left meta left super right super alt gr compose help print screen sys
 
 
 struct KeyState {
-    TimeBool8 button;
+    int64_t frames_down = 0;
+    int64_t frames_up = 2;  // Unpressed at initialization: has been up for more than 1 frame.
     bool repeat = false;
 
-    double lasttime[2];
-    int2 lastpos[2];
+    double lasttime[2] = { -1, -1 };
+    int2 lastpos[2] = { int2(-1, -1), int2(-1, -1) };
 
-    KeyState() {
-        lasttime[0] = lasttime[1] = 0x80000000;
-        lastpos[0] = lastpos[1] = int2(-1, -1);
+    void Reset() {
+        frames_down = 0;
+        frames_up = 2;
+        repeat = false;
     }
 
-    void FrameReset() {
-        button.Advance();
+    void Set(bool on) {
+        if (on) {
+            frames_down = 1;
+            if (frames_up > 1) frames_up = 0;  // Not in this frame, so turn off.
+        } else {
+            frames_up = 1;
+            if (frames_down > 1) frames_down = 0;  // Not in this frame, so turn off.
+        }
+    }
+
+    void FrameAdvance() {
+        if (frames_up) {
+            frames_up++;
+            frames_down = 0;  // In case it was down+up last frame.
+        }
+        if (frames_down) {
+            frames_down++;
+            // This situation doesn't occur, a single frame up+down will get interpreted as down+up above.
+            // Hopefully that will be much more rare than single frame down+up :)
+            assert(!frames_up);
+        }
         repeat = false;
+    }
+
+    pair<int64_t, int64_t> State() {
+        return { frames_down, frames_up };
+    }
+
+    pair<int64_t, int64_t> Prev() {
+        return { std::max(int64_t(0), frames_down - 1),
+                 std::max(int64_t(0), frames_up - 1) };
     }
 };
 
@@ -110,9 +145,11 @@ Finger fingers[MAXFINGERS];
 
 void updatebutton(string &name, bool on, int posfinger, bool repeat) {
     auto &ks = keymap[name];
-    ks.button.Set(on);
-    ks.lasttime[on] = lasttime;
-    ks.lastpos[on] = fingers[posfinger].mousepos;
+    if (!repeat) {
+        ks.Set(on);
+        ks.lasttime[on] = lasttime;
+        ks.lastpos[on] = fingers[posfinger].mousepos;
+    }
     ks.repeat = repeat;
 }
 
@@ -379,12 +416,75 @@ string SDLInit(string_view title, const int2 &desired_screensize, InitFlags flag
     return OpenGLInit(samples, flags & INIT_LINEAR_COLOR);
 }
 
+string SDLDebuggerWindow() {
+    #ifdef PLATFORM_ES3
+        return "Can\'t open debugger window on non-desktop platform";
+    #endif
+    if (!_sdl_debugger_context) {
+        _sdl_debugger_window = SDL_CreateWindow(
+            "Lobster Debugger", 100, SDL_WINDOWPOS_CENTERED, 600, 800,
+            SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE |
+                SDL_WINDOW_ALLOW_HIGHDPI);
+        if (!_sdl_debugger_window)
+            return "Debugger SDL_CreateWindow fail";
+        _sdl_debugger_context = SDL_GL_CreateContext(_sdl_debugger_window);
+        if (!_sdl_debugger_context)
+            return "Debugger SDL_GL_CreateContext fail";
+        return OpenGLInit(1, true);
+    } else {
+        SDL_GL_MakeCurrent(_sdl_debugger_window, _sdl_debugger_context);
+        return {};
+    }
+}
+
+void SDLDebuggerOff() {
+    SDL_GL_MakeCurrent(_sdl_window, _sdl_context);
+    // Reset since we may have interrupted a user interaction.
+    for (auto &it : keymap) it.second.Reset();
+}
+
+bool SDLDebuggerFrame() {
+    #ifndef __EMSCRIPTEN__
+        SDL_GL_SwapWindow(_sdl_debugger_window);
+    #endif
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        extern pair<bool, bool> IMGUIEvent(SDL_Event *event);
+        IMGUIEvent(&event);
+        switch (event.type) {
+            case SDL_QUIT:
+                return true;
+            case SDL_WINDOWEVENT: 
+                switch (event.window.event) {
+                    case SDL_WINDOWEVENT_CLOSE:
+                        return true;
+                }
+                break;
+        }
+    }
+    return false;
+}
+
 double GetSeconds() { return (double)(SDL_GetPerformanceCounter() - timestart) / (double)timefreq; }
 
 void SDLShutdown() {
     // FIXME: SDL gives ERROR: wglMakeCurrent(): The handle is invalid. upon SDL_GL_DeleteContext
-    if (_sdl_context) { /*SDL_GL_DeleteContext(_sdl_context);*/ _sdl_context = nullptr; }
-    if (_sdl_window) { SDL_DestroyWindow(_sdl_window); _sdl_window = nullptr; }
+    if (_sdl_context) {
+        //SDL_GL_DeleteContext(_sdl_context);
+        _sdl_context = nullptr;
+    }
+    if (_sdl_window) {
+        SDL_DestroyWindow(_sdl_window);
+        _sdl_window = nullptr;
+    }
+    if (_sdl_debugger_context) {
+        //SDL_GL_DeleteContext(_sdl_debugger_context);
+        _sdl_debugger_context = nullptr;
+    }
+    if (_sdl_debugger_window) {
+        SDL_DestroyWindow(_sdl_debugger_window);
+        _sdl_debugger_window = nullptr;
+    }
 
     SDL_Quit();
 }
@@ -411,7 +511,7 @@ bool SDLFrame() {
     frametimelog.push_back((float)frametime);
     if (frametimelog.size() > 64) frametimelog.erase(frametimelog.begin());
 
-    for (auto &it : keymap) it.second.FrameReset();
+    for (auto &it : keymap) it.second.FrameAdvance();
 
     mousewheeldelta = 0;
     clearfingers(true);
@@ -550,6 +650,9 @@ bool SDLFrame() {
                             updatemousebutton(i, false);
                         */
                         break;
+                    case SDL_WINDOWEVENT_CLOSE:
+                        closebutton = true;
+                        break;
                 }
                 break;
 
@@ -611,37 +714,38 @@ void SDLWindowMinMax(int dir) {
 double SDLTime() { return lasttime; }
 double SDLDeltaTime() { return frametime; }
 
-TimeBool8 GetKS(string_view name) {
-    auto ks = keymap.find(name);
-    if (ks == keymap.end()) return {};
+pair<int64_t, int64_t> GetKS(string_view name) {
+    auto &ks = keymap[string(name)];
     #ifdef PLATFORM_TOUCH
         // delayed results by one frame, that way they get 1 frame over finger hovering over target,
         // which makes gl_hit work correctly
         // FIXME: this causes more lag on mobile, instead, set a flag that this is the first frame we're touching,
         // and make that into a special case inside gl_hit
-        return ks->second.button.Back();
+        return ks.Prev();
     #else
-        return ks->second.button;
+        return ks.State();
     #endif
 }
 
 bool KeyRepeat(string_view name) {
-    auto ks = keymap.find(name);
-    if (ks == keymap.end()) return {};
-    return ks->second.repeat;
+    auto &ks = keymap[string(name)];
+    return ks.repeat;
 }
 
 double GetKeyTime(string_view name, int on) {
-    auto ks = keymap.find(name);
-    return ks == keymap.end() ? -3600 : ks->second.lasttime[on];
+    auto &ks = keymap[string(name)];
+    return ks.lasttime[on];
 }
 
 int2 GetKeyPos(string_view name, int on) {
-    auto ks = keymap.find(name);
-    return ks == keymap.end() ? int2(-1, -1) : ks->second.lastpos[on];
+    auto &ks = keymap[string(name)];
+    return ks.lastpos[on];
 }
 
-void SDLTitle(string_view title) { SDL_SetWindowTitle(_sdl_window, null_terminated(title)); }
+void SDLTitle(string_view title) {
+    LOBSTER_FRAME_PROFILE_THIS_FUNCTION;
+    SDL_SetWindowTitle(_sdl_window, null_terminated(title));
+}
 
 int SDLWheelDelta() { return mousewheeldelta; }
 bool SDLIsMinimized() { return minimized; }

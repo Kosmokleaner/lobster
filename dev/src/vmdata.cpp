@@ -15,13 +15,14 @@
 #include "lobster/stdafx.h"
 
 #include "lobster/vmdata.h"
+#include "lobster/natreg.h"
 
 namespace lobster {
 
 LString::LString(iint _l) : RefObj(TYPE_ELEM_STRING), len(_l) { ((char *)data())[_l] = 0; }
 
-LResource::LResource(void *v, const ResourceType *t)
-    : RefObj(TYPE_ELEM_RESOURCE), val(v), type(t) {}
+LResource::LResource(const ResourceType *t, Resource *res)
+    : RefObj(TYPE_ELEM_RESOURCE), type(t), res(res) {}
 
 char HexChar(char i) { return i + (i < 10 ? '0' : 'A' - 10); }
 
@@ -87,25 +88,17 @@ void LVector::Append(VM &vm, LVector *from, iint start, iint amount) {
     if (len + amount > maxl) Resize(vm, len + amount);  // FIXME: check overflow
     assert(width == from->width);
     t_memcpy(v + len * width, from->v + start * width, amount * width);
-    auto et = from->ElemType(vm).t;
-    if (IsRefNil(et)) {
-        for (int i = 0; i < amount * width; i++) {
-            v[len * width + i].LTINCRTNIL();
-        }
-    }
     len += amount;
+    IncElementRange(vm, len - amount, len);
 }
 
 void LVector::Remove(StackPtr &sp, VM &vm, iint i, iint n, iint decfrom, bool stack_ret) {
     assert(n >= 0 && n <= len && i >= 0 && i <= len - n);
     if (stack_ret) {
         tsnz_memcpy(TopPtr(sp), v + i * width, width);
-        PushN(sp,  (int)width);
+        PushN(sp, (int)width);
     }
-    auto et = ElemType(vm).t;
-    if (IsRefNil(et)) {
-        for (iint j = decfrom * width; j < n * width; j++) DecSlot(vm, i * width + j, et);
-    }
+    DestructElementRange(vm, i + decfrom, i + n - decfrom);
     t_memmove(v + i * width, v + (i + n) * width, (len - i - n) * width);
     len -= n;
 }
@@ -116,11 +109,11 @@ void LVector::AtVW(StackPtr &sp, iint i) const {
     PushN(sp, (int)width);
 }
 
-void LVector::AtVWInc(StackPtr &sp, iint i) const {
+void LVector::AtVWInc(StackPtr &sp, iint i, int bitmask) const {
     auto src = AtSt(i);
     for (int j = 0; j < width; j++) {
         auto e = src[j];
-        e.LTINCRTNIL();
+        if ((1 << j) & bitmask) e.LTINCRTNIL();
         lobster::Push(sp, e);
     }
 }
@@ -131,11 +124,46 @@ void LVector::AtVWSub(StackPtr &sp, iint i, int w, int off) const {
     PushN(sp,  w);
 }
 
-void LVector::DeleteSelf(VM &vm) {
-    auto et = ElemType(vm).t;
-    if (IsRefNil(et)) {
-        for (iint i = 0; i < len * width; i++) DecSlot(vm, i, et);
+void LVector::DestructElementRange(VM& vm, iint from, iint to) {
+    auto &eti = ElemType(vm);
+    if (!IsRefNil(eti.t)) return;
+    if (eti.t == V_STRUCT_R && eti.vtable_start_or_bitmask != (1 << width) - 1) {
+        // We only run this special loop for mixed ref/scalar.
+        for (int j = 0; j < width; j++) {
+            if ((1 << j) & eti.vtable_start_or_bitmask) {
+                for (iint i = from; i < to; i++) {
+                    AtSlot(i * width + j).LTDECRTNIL(vm);
+                }
+            }
+        }
+    } else {
+        for (iint i = from * width; i < to * width; i++) {
+            AtSlot(i).LTDECRTNIL(vm);
+        }
     }
+}
+
+void LVector::IncElementRange(VM &vm, iint from, iint to) {
+    auto &eti = ElemType(vm);
+    if (!IsRefNil(eti.t)) return;
+    if (eti.t == V_STRUCT_R && eti.vtable_start_or_bitmask != (1 << width) - 1) {
+        // We only run this special loop for mixed ref/scalar.
+        for (int j = 0; j < width; j++) {
+            if ((1 << j) & eti.vtable_start_or_bitmask) {
+                for (iint i = from; i < to; i++) {
+                    AtSlot(i * width + j).LTINCRTNIL();
+                }
+            }
+        }
+    } else {
+        for (iint i = from * width; i < to * width; i++) {
+            AtSlot(i).LTINCRTNIL();
+        }
+    }
+}
+
+void LVector::DeleteSelf(VM &vm) {
+    DestructElementRange(vm, 0, len);
     DeallocBuf(vm);
     vm.pool.dealloc_small(this);
 }
@@ -149,8 +177,18 @@ void LObject::DeleteSelf(VM &vm) {
 }
 
 void LResource::DeleteSelf(VM &vm) {
-    type->deletefun(val);
+    if (owned) delete res;
     vm.pool.dealloc(this, sizeof(LResource));
+}
+
+LResource *VM::NewResource(const ResourceType *type, Resource *res) {
+    #undef new
+    auto r = new (pool.alloc(sizeof(LResource))) LResource(type, res);
+    #if defined(_MSC_VER) && !defined(NDEBUG)
+        #define new DEBUG_NEW
+    #endif
+    OnAlloc(r);
+    return r;
 }
 
 void RefObj::DECDELETENOW(VM &vm) {
@@ -187,6 +225,7 @@ bool RefEqual(VM &vm, const RefObj *a, const RefObj *b, bool structural) {
         case V_STRING:      return *((LString *)a) == *((LString *)b);
         case V_VECTOR:      return structural && ((LVector *)a)->Equal(vm, *(LVector *)b);
         case V_CLASS:       return structural && ((LObject *)a)->Equal(vm, *(LObject *)b);
+        case V_RESOURCE:    return false;
         default:            assert(0); return false;
     }
 }
@@ -269,25 +308,47 @@ void Value::ToFlexBuffer(VM &vm, flexbuffers::Builder &builder, ValueType t) con
 }
 
 
-iint RefObj::Hash(VM &vm) {
+uint64_t RefObj::Hash(VM &vm) {
     switch (ti(vm).t) {
         case V_STRING:      return ((LString *)this)->Hash();
         case V_VECTOR:      return ((LVector *)this)->Hash(vm);
         case V_CLASS:       return ((LObject *)this)->Hash(vm);
-        default:            return (iint)this;
+        default:            return SplitMix64Hash((uint64_t)this);
     }
 }
 
-iint LString::Hash() {
+uint64_t LString::Hash() {
     return FNV1A64(strv());
 }
 
-iint Value::Hash(VM &vm, ValueType vtype) {
+uint64_t LVector::Hash(VM &vm) {
+    auto &eti = ElemType(vm);
+    auto hash = SplitMix64Hash((uint64_t)(len * width));
+    if (IsStruct(eti.t)) {
+        for (iint i = 0; i < len; i++) {
+            for (int j = 0; j < width; j++) {
+                assert(width == eti.len);
+                auto &ti = vm.GetTypeInfo(eti.elemtypes[j]);
+                hash = hash * 31 + AtSub(i, j).Hash(vm, ti.t);
+            }
+        }
+    } else {
+        for (iint i = 0; i < len; i++) {
+            hash = hash * 31 + At(i).Hash(vm, eti.t);
+        }
+    }
+    return hash;
+}
+
+uint64_t Value::Hash(VM &vm, ValueType vtype) {
     switch (vtype) {
-        case V_INT: return ival_;
-        case V_FLOAT: return ReadMem<iint>(&fval_);
-        case V_FUNCTION: return ival_;
-        default: return refnil() ? ref()->Hash(vm) : 0;
+        case V_INT:
+        case V_FUNCTION:
+            return SplitMix64Hash((uint64_t)ival_);
+        case V_FLOAT:
+            return SplitMix64Hash(ReadMem<uint64_t>(&fval_));
+        default:
+            return refnil() ? ref()->Hash(vm) : 0;
     }
 }
 
@@ -326,27 +387,50 @@ Value Value::CopyRef(VM &vm, bool deep) {
         return Value(s);
     }
     default:
-        assert(false);
+        vm.BuiltinError("Can\'t copy type: " + ti.Debug(vm, false));
         return NilVal();
     }
 }
 
 string TypeInfo::Debug(VM &vm, bool rec) const {
-    string s;
-    s += BaseTypeName(t);
-    if (t == V_VECTOR || t == V_NIL) {
-        s += "[" + vm.GetTypeInfo(subt).Debug(vm, false) + "]";
+    if (t == V_VECTOR) {
+        return cat("[", vm.GetTypeInfo(subt).Debug(vm, false), "]");
+    } else if (t == V_NIL) {
+        return cat(vm.GetTypeInfo(subt).Debug(vm, false), "?");
     } else if (IsUDT(t)) {
-        auto sname = vm.StructName(*this);
-        s += ":" + sname;
+        string s = string(vm.StructName(*this));
         if (rec) {
             s += "{";
             for (int i = 0; i < len; i++)
                 s += vm.GetTypeInfo(elemtypes[i]).Debug(vm, false) + ",";
             s += "}";
         }
+        return s;
+    } else {
+        return string(BaseTypeName(t));
     }
-    return s;
+}
+
+void TypeInfo::Print(VM &vm, string &sd) const {
+    switch (t) {
+        case V_VECTOR:
+            append(sd, "[");
+            vm.GetTypeInfo(subt).Print(vm, sd);
+            append(sd, "]");
+            break;
+        case V_NIL:
+            vm.GetTypeInfo(subt).Print(vm, sd);
+            append(sd, "?");
+            break;
+        case V_CLASS:
+        case V_STRUCT_R:
+        case V_STRUCT_S:
+            append(sd, vm.StructName(*this));
+            break;
+        default:
+            append(sd, BaseTypeName(t));
+            break;
+    }
 }
 
 #define ELEMTYPE(acc, ass) \
@@ -410,7 +494,8 @@ void VectorOrObjectToString(VM &vm, string &sd, PrintPrefs &pp, char openb, char
 
 void LObject::ToString(VM &vm, string &sd, PrintPrefs &pp) {
     if (CycleCheck(sd, pp)) return;
-    sd += vm.ReverseLookupType(ti(vm).structidx);
+    auto name = vm.ReverseLookupType(ti(vm).structidx);
+    sd += name;
     if (pp.indent) sd += ' ';
     VectorOrObjectToString(vm, sd, pp, '{', '}', Len(vm), 1, Elems(), false,
         [&](iint i) -> const TypeInfo & {
@@ -428,6 +513,10 @@ void LVector::ToString(VM &vm, string &sd, PrintPrefs &pp) {
     );
 }
 
+void LResource::ToString(string &sd) {
+    append(sd, "(resource:", type->name, ")");
+}
+
 void VM::StructToString(string &sd, PrintPrefs &pp, const TypeInfo &ti, const Value *elems) {
     sd += ReverseLookupType(ti.structidx);
     if (pp.indent) sd += ' ';
@@ -437,7 +526,6 @@ void VM::StructToString(string &sd, PrintPrefs &pp, const TypeInfo &ti, const Va
         }
     );
 }
-
 
 void ElemToFlexBuffer(VM &vm, flexbuffers::Builder &builder, const TypeInfo &ti,
                       iint &i, iint width, const Value *elems, bool is_vector) {

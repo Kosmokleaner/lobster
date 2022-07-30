@@ -13,13 +13,15 @@
 // limitations under the License.
 
 #include "lobster/stdafx.h"
+#include "lobster/il.h"
 #include "lobster/disasm.h"  // Some shared bytecode utilities.
 #include "lobster/compiler.h"
 #include "lobster/tonative.h"
 
 namespace lobster {
 
-string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bool cpp) {
+string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bool cpp,
+             int runtime_checks) {
     auto bcf = bytecode::GetBytecodeFile(bytecode_buffer.data());
     if (!FLATBUFFERS_LITTLEENDIAN) return "native code gen requires little endian";
     auto code = (const int *)bcf->bytecode()->Data();  // Assumes we're on a little-endian machine.
@@ -66,6 +68,17 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
             "#define Pop(sp) (*--(sp))\n"
             "#define Push(sp, V) (*(sp)++ = (V))\n"
             "#define TopM(sp, N) (*((sp) - (N) - 1))\n"
+            "struct ___tracy_source_location_data {\n"
+            "    const char *name;\n"
+            "    const char *function;\n"
+            "    const char *file;\n"
+            "    unsigned int line;\n"
+            "    unsigned int color;\n"
+            "};\n"
+            "struct ___tracy_c_zone_context {\n"
+            "    unsigned int id;\n"
+            "    int active;\n"
+            "};\n"
             "\n"
             ;
 
@@ -105,12 +118,22 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
               "extern void RestoreBackup(VMRef, int);\n"
               "extern StackPtr PopArg(VMRef, int, StackPtr);\n"
               "extern void SetLVal(VMRef, Value *);\n"
+              "extern int RetSlots(VMRef);\n"
+              "extern void PushFunId(VMRef, const int *, StackPtr);\n"
+              "extern void PopFunId(VMRef);\n"
+              #if LOBSTER_FRAME_PROFILER
+              "extern struct ___tracy_c_zone_context StartProfile(struct ___tracy_source_location_data *);\n"
+              "extern void EndProfile(struct ___tracy_c_zone_context);\n"
+              #endif
               "\n";
+    }
+
+    if (runtime_checks >= RUNTIME_ASSERT_PLUS) {
+        append(sd, "extern const int funinfo_table[];\n\n");
     }
 
     vector<int> var_to_local;
     var_to_local.resize(specidents->size(), -1);
-    int numlocals = -1;
 
     auto len = bcf->bytecode()->size();
     auto ip = code;
@@ -127,7 +150,7 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
         }
         if ((false)) {  // Debug corrupt bytecode.
             string da;
-            DisAsmIns(natreg, da, ip, code, typetable, bcf);
+            DisAsmIns(natreg, da, ip, code, typetable, bcf, -1);
             LOG_DEBUG(da);
         }
         int opc = *ip++;
@@ -139,6 +162,7 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
     }
     sd += "\n";
     vector<const int *> jumptables;
+    vector<int> funstarttables;
     ip = code + 3;  // Past first IL_JUMP.
     const int *funstart = nullptr;
     int nkeepvars = 0;
@@ -146,6 +170,7 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
     string sdt, sp;
     int opc = -1;
     const int *args = nullptr;
+    bool has_profile = false;
     auto comment = [&](string_view c) { append(sd, " // ", c); };
     while (ip < code + len) {
         int id = (int)(ip - code);
@@ -157,11 +182,14 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
             nkeepvars = 0;
             ndefsave = 0;
             sdt.clear();
+            has_profile = false;
             auto it = function_lookup.find(id);
             auto f = it != function_lookup.end() ? it->second : nullptr;
             sd += "\n";
             if (f) append(sd, "// ", f->name()->string_view(), "\n");
             append(sd, "static void fun_", id, "(VMRef vm, StackPtr psp) {\n");
+            const int *funstartend = nullptr;
+            int numlocals = 0;
             if (opc == IL_FUNSTART) {
                 auto fip = funstart;
                 fip++;  // definedfunction
@@ -173,11 +201,11 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
                 auto defs = fip;
                 fip += ndefsave;
                 nkeepvars = *fip++;
+                funstartend = fip;
                 #ifndef NDEBUG
                     var_to_local.clear();
                     var_to_local.resize(specidents->size(), -1);
                 #endif
-                numlocals = 0;
                 for (int j = 0; j < 2; j++) {
                     auto vars = j ? defs : nargs;
                     auto len = j ? ndefsave : nargs_fun;
@@ -228,6 +256,15 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
                         else
                             append(sd, "    NilVal(&locals[", var_to_local[varidx], "]);\n");
                     }
+                }
+                if (runtime_checks >= RUNTIME_ASSERT_PLUS) {
+                    // FIXME: can make this just and index and instead store funinfo_table ref in VM.
+                    // Calling this here because now locals have been fully initialized.
+                    append(sd, "    PushFunId(vm, funinfo_table + ", funstarttables.size(), ", ",
+                           numlocals ? "locals" : "0", ");\n");
+                    // TODO: this doesn't need to correspond to to funstart, can stick any info we
+                    // want in here.
+                    funstarttables.insert(funstarttables.end(), funstart, funstartend);
                 }
                 nkeepvars = *fip++;
                 for (int i = 0; i < nkeepvars; i++) {
@@ -321,7 +358,8 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
                     comment(natreg.nfuns[args[0]]->name);
                 }
                 break;
-            case IL_RETURN:
+            case IL_RETURNLOCAL:
+            case IL_RETURNNONLOCAL:
             case IL_RETURNANY: {
                 // FIXME: emit epilogue stuff only once at end of function.
                 auto fip = funstart;
@@ -334,13 +372,13 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
                 auto defvars = fip;
                 fip += ndef;
                 fip++;  // nkeepvars, already parsed above
-                int nrets;
-                if (opc == IL_RETURN) {
-                    nrets = args[1];
-                    append(sd, "U_RETURN(vm, 0, ", args[0], ", ", nrets, ");");
+                int nrets = args[0];
+                if (opc == IL_RETURNLOCAL) {
+                    append(sd, "U_RETURNLOCAL(vm, 0, ", nrets, ");");
+                } else if (opc == IL_RETURNNONLOCAL) {
+                    append(sd, "U_RETURNNONLOCAL(vm, 0, ", nrets, ", ", args[1], ");");
                 } else {
-                    nrets = args[0];
-                    append(sd, "U_RETURNANY(vm, 0, ", nrets, ", ", args[1], ");");
+                    append(sd, "U_RETURNANY(vm, 0, ", nrets, ");");
                 }
                 auto ownedvars = *fip++;
                 for (int i = 0; i < ownedvars; i++) {
@@ -360,9 +398,13 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
                         append(sd, "\n    Pop(psp);");
                     }
                 }
-                auto unwind_diff = opc == IL_RETURNANY ? nrets - args[1] : 0;
-                for (int i = 0; i < nrets; i++) {
-                    append(sd, "\n    Push(psp, regs[", regso - nrets + i + unwind_diff, "]);");
+                if (opc == IL_RETURNANY) {
+                    append(sd, "\n    { int rs = RetSlots(vm); for (int i = 0; i < rs; i++) "
+                                          "Push(psp, regs[i + ", regso - nrets, "]); }");
+                } else {
+                    for (int i = 0; i < nrets; i++) {
+                        append(sd, "\n    Push(psp, regs[", i + regso - nrets, "]);");
+                    }
                 }
                 sdt.clear();  // FIXME: remove
                 for (int i = ndef - 1; i >= 0; i--) {
@@ -371,7 +413,7 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
                         append(sdt, "    RestoreBackup(vm, ", varidx, ");\n");
                     }
                 }
-                if (opc == IL_RETURN) {
+                if (opc != IL_RETURNANY) {
                     append(sd, "\n    goto epilogue;");
                 }
                 break;
@@ -406,6 +448,14 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
                 if (cpp) append(sd, "vm.next_call_target(vm, ", sp, ");");
                 else append(sd, "GetNextCallTarget(vm)(vm, ", sp, ");");
                 break;
+            case IL_PROFILE: {
+                string name;
+                EscapeAndQuote(bcf->stringtable()->Get(args[0])->string_view(), name);
+                append(sd, "static struct ___tracy_source_location_data tsld = { ", name, ", ", name,
+                       ", \"\", 0, 0x888800 }; struct ___tracy_c_zone_context ctx = StartProfile(&tsld);");
+                has_profile = true;
+                break;
+            }
             default:
                 assert(ILArity()[opc] != ILUNKNOWN);
                 append(sd, "U_", ILNames()[opc], "(vm, ", sp, "");
@@ -442,9 +492,15 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
         sd += "\n";
         if (ip == code + len || *ip == IL_FUNSTART || ip == starting_ip) {
             if (opc != IL_EXIT && opc != IL_ABORT) sd += "    epilogue:;\n";
+            if (has_profile) {
+                append(sd, "    EndProfile(ctx);\n");
+            }
             if (!sdt.empty()) append(sd, sdt);
             for (int i = 0; i < nkeepvars; i++) {
                 append(sd, "    DecVal(vm, keepvar[", i, "]);\n");
+            }
+            if (*(funstart - 2) == IL_FUNSTART && runtime_checks >= RUNTIME_ASSERT_PLUS) {
+                append(sd, "    PopFunId(vm);\n");
             }
             sd += "}\n";
         }
@@ -460,6 +516,15 @@ string ToCPP(NativeRegistry &natreg, string &sd, string_view bytecode_buffer, bo
         sd += ",\n";
     }
     sd += "    0\n};\n";  // Make sure table is never empty.
+
+    if (runtime_checks >= RUNTIME_ASSERT_PLUS) {
+        append(sd, "const int funinfo_table[] = {\n    ");
+        for (auto [i, d] : enumerate(funstarttables)) {
+            if (i && (i & 15) == 0) append(sd, "\n    ");
+            append(sd, d, ", ");
+        }
+        append(sd, "    0\n};\n\n");
+    }
 
     if (cpp) {
         // Output only the metadata part of the bytecode, not the bytecode itself.

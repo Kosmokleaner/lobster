@@ -19,8 +19,6 @@
 
 namespace lobster {
 
-enum { RUNTIME_NO_ASSERT, RUNTIME_ASSERT, RUNTIME_ASSERT_PLUS };
-
 extern void Compile(NativeRegistry &natreg, string_view fn, string_view stringsource,
                     string &bytecode, string *parsedump, string *pakfile,
                     bool return_value, int runtime_checks);
@@ -32,7 +30,9 @@ extern string RunTCC(NativeRegistry &nfr,
                      vector<string> &&program_args,
                      TraceMode trace,
                      bool compile_only,
-                     string &error);
+                     string &error,
+                     int runtime_checks,
+                     bool dump_leaks);
 
 extern bool LoadPakDir(const char *lpak);
 extern bool LoadByteCode(string &bytecode);
