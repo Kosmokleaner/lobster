@@ -136,11 +136,13 @@
         GLEXT(PFNGLMEMORYBARRIERPROC                 , glMemoryBarrier                 , 0) \
         GLEXT(PFNGLMAPBUFFERRANGEPROC                , glMapBufferRange                , 0) \
         GLEXT(PFNGLGENQUERIESPROC                    , glGenQueries                    , 0) \
+        GLEXT(PFNGLGETSTRINGIPROC                    , glGetStringi                    , 0) \
         GLEXT(PFNGLGETINTEGER64VPROC                 , glGetInteger64v                 , 0) \
         GLEXT(PFNGLGETQUERYIVPROC                    , glGetQueryiv                    , 0) \
         GLEXT(PFNGLGETQUERYOBJECTIVPROC              , glGetQueryObjectiv              , 0) \
         GLEXT(PFNGLGETQUERYOBJECTUI64VPROC           , glGetQueryObjectui64v           , 0) \
         GLEXT(PFNGLQUERYCOUNTERPROC                  , glQueryCounter                  , 0) \
+        GLEXT(PFNGLOBJECTLABELPROC                   , glObjectLabel                   , 0) \
         GLEXT(PFNGLDEBUGMESSAGECALLBACKPROC          , glDebugMessageCallback          , 0) \
         GLEXT(PFNGLDEBUGMESSAGEINSERTPROC            , glDebugMessageInsert            , 0)
     #define GLEXT(type, name, needed) extern type name;
@@ -157,6 +159,14 @@
 #else
     #define GL_CHECK(what) (void)what
     #define GL_CALL(call) do { call; } while (0)
+#endif
+
+#ifdef PLATFORM_WINNIX
+    #define GL_NAME(type, id, name) \
+        { if (glObjectLabel) { auto _name = name; glObjectLabel(type, id, (GLsizei)_name.size(), _name.data()); } }
+#else
+    #define GL_NAME(type, id, name) \
+        { (void)(name); }
 #endif
 
 // Implementation-only enum.

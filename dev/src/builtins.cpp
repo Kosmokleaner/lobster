@@ -375,7 +375,7 @@ nfr("substring", "s,start,size", "SII", "S",
         iint size = e.ival();
         iint start = s.ival();
         if (size < 0) size = l.sval()->len - start;
-        if (start < 0 || start + size > l.sval()->len)
+        if (start < 0 || size < 0 || start + size > l.sval()->len)
             vm.BuiltinError("substring: values out of range");
 
         auto ns = vm.NewString(string_view(l.sval()->data() + start, (size_t)size));
@@ -445,30 +445,37 @@ nfr("string_to_int", "s,base", "SI?", "IB",
         return Value(end == sv.data() + sv.size());
     });
 
-nfr("string_to_float", "s", "S", "F",
-    "converts a string to a float. returns 0.0 if no numeric data could be parsed",
-    [](StackPtr &, VM &, Value &s) {
-        auto f = strtod(s.sval()->data(), nullptr);
-        return Value(f);
+nfr("string_to_float", "s", "S", "FB",
+    "converts a string to a float. returns 0.0 if no numeric data could be parsed;"
+    "second return value is true if all characters of the string were parsed.",
+    [](StackPtr &sp, VM &, Value &s) {
+        char *end;
+        auto sv = s.sval()->strv();
+        auto f = strtod(sv.data(), &end);
+        Push(sp, f);
+        return Value(end == sv.data() + sv.size());
     });
 
-nfr("tokenize", "s,delimiters,whitespace", "SSS", "S]",
+nfr("tokenize", "s,delimiters,whitespace,dividing", "SSSI?", "S]",
     "splits a string into a vector of strings, by splitting into segments upon each dividing or"
     " terminating delimiter. Segments are stripped of leading and trailing whitespace."
-    " Example: \"; A ; B C; \" becomes [ \"\", \"A\", \"B C\" ] with \";\" as delimiter and"
-    " \" \" as whitespace.",
-    [](StackPtr &, VM &vm, Value &s, Value &delims, Value &whitespace) {
+    " Example: \"; A ; B C;; \" becomes [ \"\", \"A\", \"B C\", \"\" ] with \";\" as delimiter and"
+    " \" \" as whitespace. If dividing was true, there would be a 5th empty string element.",
+    [](StackPtr &, VM &vm, Value &s, Value &delims, Value &whitespace, Value &dividing) {
         auto v = (LVector *)vm.NewVec(0, 0, TYPE_ELEM_VECTOR_OF_STRING);
         auto ws = whitespace.sval()->strv();
         auto dl = delims.sval()->strv();
         auto p = s.sval()->strv();
         p.remove_prefix(std::min(p.find_first_not_of(ws), p.size()));
-        while (!p.empty()) {
+        bool has_delim = false;
+        while (!p.empty() || (has_delim && dividing.True())) {
             auto delim = std::min(p.find_first_of(dl), p.size());
-            auto end = std::min(p.find_last_not_of(ws) + 1, delim);
+            auto delimstr = p.substr(0, delim);
+            auto end = std::min(delimstr.find_last_not_of(ws) + 1, delim);
             v->Push(vm, vm.NewString(string_view(p.data(), end)));
             p.remove_prefix(delim);
-            p.remove_prefix(std::min(p.find_first_not_of(dl), p.size()));
+            has_delim = std::min(p.find_first_not_of(dl), p.size()) != 0;
+            if (has_delim) p.remove_prefix(1);
             p.remove_prefix(std::min(p.find_first_not_of(ws), p.size()));
         }
         return Value(v);
@@ -1279,8 +1286,8 @@ nfr("date_time_string", "utc", "B?", "S",
 nfr("assert", "condition", "A*", "Ab1",
     "halts the program with an assertion failure if passed false. returns its input."
     " runtime errors like this will contain a stack trace if --runtime-verbose is on.",
-    [](StackPtr &, VM &vm, Value &c) {
-        if (c.False()) vm.BuiltinError("assertion failed");
+    [](StackPtr &, VM &, Value &c) {
+        assert(false);  // This builtin implemented as IL_ASSERT.
         return c;
     });
 

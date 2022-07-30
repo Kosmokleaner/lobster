@@ -16,6 +16,8 @@
 //
 #include "lobster/stdafx.h"
 
+#include "lobster/il.h"
+
 #include "lobster/lex.h"
 #include "lobster/idents.h"
 #include "lobster/node.h"
@@ -332,7 +334,7 @@ void Compile(NativeRegistry &nfr, string_view fn, string_view stringsource, stri
     TypeChecker tc(parser, st, return_value);
     // Optimizer is not optional, must always run, since TypeChecker and CodeGen
     // rely on it culling const if-thens and other things.
-    Optimizer opt(parser, st, tc);
+    Optimizer opt(parser, st, tc, runtime_checks);
     if (parsedump) *parsedump = parser.DumpAll(true);
     CodeGen cg(parser, st, return_value, runtime_checks);
     st.Serialize(cg.code, cg.type_table,
@@ -360,7 +362,8 @@ string RunTCC(NativeRegistry &nfr, string_view bytecode_buffer, string_view fn,
                 auto vmargs = VMArgs {
                     nfr, string(fn), (uint8_t *)bytecode_buffer.data(),
                     bytecode_buffer.size(), std::move(program_args),
-                    (fun_base_t *)exports[1], (fun_base_t)exports[0], trace, dump_leaks
+                    (fun_base_t *)exports[1], (fun_base_t)exports[0], trace, dump_leaks,
+                    runtime_checks
                 };
                 lobster::VMAllocator vma(std::move(vmargs));
                 vma.vm->EvalProgram();
@@ -463,7 +466,7 @@ extern "C" int RunCompiledCodeMain(int argc, const char * const *argv, const uin
         InitPlatform("../../", "", false, loader);  // FIXME: path.
         auto vmargs = VMArgs {
             nfr, StripDirPart(argv[0]), bytecodefb, static_size, {},
-            vtables, nullptr, TraceMode::OFF
+            vtables, nullptr, TraceMode::OFF, false, RUNTIME_ASSERT
         };
         for (int arg = 1; arg < argc; arg++) { vmargs.program_args.push_back(argv[arg]); }
         lobster::VMAllocator vma(std::move(vmargs));

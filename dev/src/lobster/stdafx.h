@@ -51,6 +51,7 @@
 #include <memory>
 #include <optional>
 #include <charconv>
+#include <cinttypes>
 
 #if defined(__has_include) && __has_include(<string_view>)
     #include <string_view>
@@ -68,6 +69,8 @@
 using namespace std;
 
 #include "gsl/gsl-lite.hpp"
+
+using gsl::span;
 
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/flexbuffers.h"
@@ -99,8 +102,15 @@ using namespace geom;
     #define LOBSTER_ENGINE 1
 #endif
 
-#if LOBSTER_ENGINE && defined(_WIN32)
-    #define LOBSTER_FRAME_PROFILER 1
+// Disabled by default because of several out-standing bugs with Tracy.
+// https://github.com/wolfpld/tracy/issues/422
+// https://github.com/wolfpld/tracy/issues/419
+// Overhead should be low enough that eventually we want this on in all builds.
+#ifndef LOBSTER_FRAME_PROFILER
+    #define LOBSTER_FRAME_PROFILER 0
+#endif
+
+#if LOBSTER_FRAME_PROFILER && LOBSTER_ENGINE && defined(_WIN32)
     #define TRACY_ENABLE 1
     #define TRACY_ON_DEMAND 1
     #define TRACY_ONLY_LOCALHOST 1
@@ -112,13 +122,10 @@ using namespace geom;
     #undef new
     #include "Tracy.hpp"
     #include "TracyC.h"
-    #ifdef _MSC_VER
-        #ifndef NDEBUG
-            #define new DEBUG_NEW
-        #endif
+    #if defined(_MSC_VER) && !defined(NDEBUG)
+        #define new DEBUG_NEW
     #endif
 #else
-    #define LOBSTER_FRAME_PROFILER 0
     #define LOBSTER_FRAME_PROFILER_BUILTINS 0
     #define LOBSTER_FRAME_PROFILER_FUNCTIONS 0
     #define LOBSTER_FRAME_PROFILE_THIS_FUNCTION

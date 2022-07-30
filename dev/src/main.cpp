@@ -15,6 +15,7 @@
 #include "lobster/stdafx.h"
 
 #include "lobster/compiler.h"
+#include "lobster/il.h"
 #include "lobster/disasm.h"
 #include "lobster/tonative.h"
 
@@ -113,6 +114,7 @@ int main(int argc, char* argv[]) {
                 else if (a == "--runtime-shipping") { runtime_checks = RUNTIME_NO_ASSERT; }
                 else if (a == "--runtime-asserts") { runtime_checks = RUNTIME_ASSERT; }
                 else if (a == "--runtime-verbose") { runtime_checks = RUNTIME_ASSERT_PLUS; }
+                else if (a == "--runtime-debug") { runtime_checks = RUNTIME_DEBUG; }
                 else if (a == "--noconsole") { SetConsole(false); }
                 else if (a == "--gen-builtins-html") { dump_builtins = true; }
                 else if (a == "--gen-builtins-names") { dump_names = true; }
@@ -120,8 +122,8 @@ int main(int argc, char* argv[]) {
                 #if LOBSTER_ENGINE
                 else if (a == "--non-interactive-test") { non_interactive_test = true; SDLTestMode(); }
                 #endif
-                else if (a == "--trace") { trace = TraceMode::ON; runtime_checks = RUNTIME_ASSERT_PLUS; }
-                else if (a == "--trace-tail") { trace = TraceMode::TAIL; runtime_checks = RUNTIME_ASSERT_PLUS; }
+                else if (a == "--trace") { trace = TraceMode::ON; runtime_checks = RUNTIME_DEBUG; }
+                else if (a == "--trace-tail") { trace = TraceMode::TAIL; runtime_checks = RUNTIME_DEBUG; }
                 else if (a == "--tcc-out") { tcc_out = true; }
                 else if (a == "--import") {
                     arg++;
@@ -156,9 +158,6 @@ int main(int argc, char* argv[]) {
         RegisterCoreLanguageBuiltins(nfr);
         auto loader = EnginePreInit(nfr);
 
-        if (dump_builtins) { DumpBuiltinDoc(nfr); return 0; }
-        if (dump_names) { DumpBuiltinNames(nfr); return 0; }
-
         if (!InitPlatform(GetMainDirFromExePath(argv[0]),
                           !mainfile.empty() ? mainfile
                                             : (!fn.empty() ? fn : string(default_lpak)),
@@ -166,6 +165,9 @@ int main(int argc, char* argv[]) {
                           loader))
             THROW_OR_ABORT("cannot find location to read/write data on this platform!");
         if (!mainfile.empty() && !fn.empty()) AddDataDir(StripFilePart(fn), false);
+
+        if (dump_builtins) { DumpBuiltinDoc(nfr); return 0; }
+        if (dump_names) { DumpBuiltinNames(nfr); return 0; }
 
         LOG_INFO("lobster version " GIT_COMMIT_INFOSTR);
 
