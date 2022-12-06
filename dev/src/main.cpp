@@ -196,7 +196,7 @@ int main(int argc, char* argv[]) {
                         lpak ? &pakfile : nullptr, false, runtime_checks);
                 if (mainfile.empty()) break;
                 if (!FileExists(mainfile, true)) {
-                    LOG_WARN(mainfile, " does not exist, skipping");
+                    //LOG_WARN(mainfile, " does not exist, skipping");
                     break;
                 }
                 fn = StripDirPart(mainfile);
@@ -204,17 +204,17 @@ int main(int argc, char* argv[]) {
             }
             LOG_INFO("time to compile (seconds): ", SecondsSinceStart() - start_time);
             if (parsedump) {
-                WriteFile("parsedump.txt", false, dump);
+                WriteFile("parsedump.txt", false, dump, false);
             }
             if (lpak) {
-                WriteFile(lpak, true, pakfile);
+                WriteFile(lpak, true, pakfile, false);
                 return 0;
             }
         }
         if (disasm) {
             string sd;
             DisAsm(nfr, sd, bytecode_buffer);
-            WriteFile("disasm.txt", false, sd);
+            WriteFile("disasm.txt", false, sd, false);
         }
         if (jit_mode) {
             string error;
@@ -232,7 +232,7 @@ int main(int argc, char* argv[]) {
                 THROW_OR_ABORT(error);
         } else {
             string sd;
-            auto err = ToCPP(nfr, sd, bytecode_buffer, true, runtime_checks);
+            auto err = ToCPP(nfr, sd, bytecode_buffer, true, runtime_checks, "nullptr");
             if (!err.empty()) THROW_OR_ABORT(err);
             // FIXME: make less hard-coded.
             auto out = "dev/compiled_lobster/src/compiled_lobster.cpp";

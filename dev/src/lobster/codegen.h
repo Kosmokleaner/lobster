@@ -212,7 +212,7 @@ struct CodeGen  {
         assert(type_table.size() == TYPE_ELEM_FIXED_OFFSET_END);
         for (auto f : parser.st.functiontable) {
             if (!f->istype) {
-                for (auto &ov : f->overloads) for (auto sf = ov.sf; sf; sf = sf->next) {
+                for (auto ov : f->overloads) for (auto sf = ov->sf; sf; sf = sf->next) {
                     if (sf->typechecked) {
                         // We only set this here, because any inlining of anonymous functions in
                         // the optimizers is likely to reduce the amount of vars for which this is
@@ -258,7 +258,7 @@ struct CodeGen  {
         for (auto f : parser.st.functiontable) {
             if (f->bytecodestart <= 0 && !f->istype) {
                 f->bytecodestart = Pos();
-                for (auto &ov : f->overloads) for (auto sf = ov.sf; sf; sf = sf->next) {
+                for (auto ov : f->overloads) for (auto sf = ov->sf; sf; sf = sf->next) {
                     if (sf->typechecked) GenScope(*sf);
                 }
                 if (f->bytecodestart == Pos()) f->bytecodestart = 0;
@@ -419,13 +419,19 @@ struct CodeGen  {
         for (int i = nretslots_norm; i < nretslots_unwind_max; i++)
             PopTemp();
         auto loc = Pos();
+        // Here we are emitting code executed only if we're falling thru,
+        // so temp modify the tstack to match that.
         auto tstackbackup = tstack;
         EmitOp(IL_RETURNANY);
         Emit(nretslots_norm);
+        // RETURNANY has taken care of falling thru retvals, but the normal retvals are
+        // still on the tstack.
+        for (int i = 0; i < nretslots_norm; i++)
+            PopTemp();
         for (auto &tse : reverse(temptypestack)) {
             GenPop(tse);
         }
-        EmitOp(IL_SAVERETS);
+        EmitOp(IL_GOTOFUNEXIT);
         SetLabel(loc);
         tstack = tstackbackup;
     }
@@ -754,17 +760,18 @@ struct CodeGen  {
                     EmitOp(GENOP(IL_AEQ + opc - MOP_EQ));
                 }
             } else {
+                bool leftisvec = ltype->t == V_STRUCT_S;
                 // If this is a comparison op, be sure to use the child type.
-                TypeRef vectype = opc >= MOP_LT ? ltype : ptype;
+                TypeRef vectype = opc >= MOP_LT ? (leftisvec ? ltype : rtype) : ptype;
                 assert(vectype->t == V_STRUCT_S);
                 auto sub = vectype->udt->sametype;
-                bool withscalar = IsScalar(rtype->t);
+                bool withscalar = IsScalar(rtype->t) || IsScalar(ltype->t);
                 auto outw = ValWidth(ptype);
                 auto inw = withscalar ? outw + 1 : outw * 2;
-                if (sub->t == V_INT)
-                    EmitOp(GENOP((withscalar ? IL_IVSADD : IL_IVVADD) + opc), inw, outw);
+                if (sub->t == V_INT) 
+                    EmitOp(GENOP((withscalar ? (leftisvec ? IL_IVSADD : IL_SIVADD) : IL_IVVADD) + opc), inw, outw);
                 else if (sub->t == V_FLOAT)
-                    EmitOp(GENOP((withscalar ? IL_FVSADD : IL_FVVADD) + opc), inw, outw);
+                    EmitOp(GENOP((withscalar ? (leftisvec ? IL_FVSADD : IL_SFVADD) : IL_FVVADD) + opc), inw, outw);
                 else assert(false);
                 EmitWidthIfStruct(vectype);
             }
@@ -954,13 +961,7 @@ void StringConstant::Generate(CodeGen &cg, size_t retval) const {
 
 void DefaultVal::Generate(CodeGen &cg, size_t retval) const {
     if (!retval) return;
-    // Optional args are indicated by being nillable, but for structs passed to builtins the type
-    // has already been made non-nil.
-    switch (exptype->ElementIfNil()->t) {
-        case V_INT:   cg.EmitOp(IL_PUSHINT); cg.Emit(0); break;
-        case V_FLOAT: cg.GenFloat(0); break;
-        default:      cg.EmitOp(IL_PUSHNIL); break;
-    }
+    cg.EmitOp(IL_PUSHNIL);
 }
 
 void IdentRef::Generate(CodeGen &cg, size_t retval) const {
@@ -1246,7 +1247,7 @@ void NativeCall::Generate(CodeGen &cg, size_t retval) const {
         // A frequently used function that doesn't actually do anything by itself, so ensure it
         // doesn't get emitted.
         cg.Gen(children[0], retval);
-        cg.TakeTemp(1, false);
+        if (retval) cg.TakeTemp(1, false);
         return;
     }
     // TODO: could pass arg types in here if most exps have types, cheaper than

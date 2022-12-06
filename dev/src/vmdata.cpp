@@ -22,7 +22,9 @@ namespace lobster {
 LString::LString(iint _l) : RefObj(TYPE_ELEM_STRING), len(_l) { ((char *)data())[_l] = 0; }
 
 LResource::LResource(const ResourceType *t, Resource *res)
-    : RefObj(TYPE_ELEM_RESOURCE), type(t), res(res) {}
+    : RefObj(TYPE_ELEM_RESOURCE), type(t), res(res) {
+    res->refc++;
+}
 
 char HexChar(char i) { return i + (i < 10 ? '0' : 'A' - 10); }
 
@@ -92,13 +94,17 @@ void LVector::Append(VM &vm, LVector *from, iint start, iint amount) {
     IncElementRange(vm, len - amount, len);
 }
 
-void LVector::Remove(StackPtr &sp, VM &vm, iint i, iint n, iint decfrom, bool stack_ret) {
+void LVector::RemovePush(StackPtr &sp, iint i) {
+    assert(len >= 1 && i >= 0 && i < len);
+    tsnz_memcpy(TopPtr(sp), v + i * width, width);
+    PushN(sp, (int)width);
+    t_memmove(v + i * width, v + (i + 1) * width, (len - i - 1) * width);
+    len--;
+}
+
+void LVector::Remove(VM &vm, iint i, iint n) {
     assert(n >= 0 && n <= len && i >= 0 && i <= len - n);
-    if (stack_ret) {
-        tsnz_memcpy(TopPtr(sp), v + i * width, width);
-        PushN(sp, (int)width);
-    }
-    DestructElementRange(vm, i + decfrom, i + n - decfrom);
+    DestructElementRange(vm, i, i + n);
     t_memmove(v + i * width, v + (i + n) * width, (len - i - n) * width);
     len -= n;
 }
@@ -177,7 +183,11 @@ void LObject::DeleteSelf(VM &vm) {
 }
 
 void LResource::DeleteSelf(VM &vm) {
-    if (owned) delete res;
+    res->refc--;
+    if (owned) {
+        assert(!res->refc);
+        delete res;
+    }
     vm.pool.dealloc(this, sizeof(LResource));
 }
 

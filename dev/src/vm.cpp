@@ -159,7 +159,7 @@ void VM::DumpLeaks() {
                 LOG_ERROR(sd);
             } else {
                 LOG_ERROR(leaks.size(), " leaks, details in ", filename);
-                WriteFile(filename, false, sd);
+                WriteFile(filename, false, sd, false);
             }
         #endif
     }
@@ -444,12 +444,12 @@ void VM::DumpStackTrace(string &sd) {
 }
 
 Value VM::Error(string err) {
+    ErrorBase(err);
     #if LOBSTER_ENGINE
         if (runtime_checks >= RUNTIME_DEBUG) {
-            BreakPoint(*this, err);
+            BreakPoint(*this, errmsg);
         }
     #endif
-    ErrorBase(err);
     DumpStackTrace(errmsg);
     UnwindOnError();
     return NilVal();
@@ -641,7 +641,7 @@ void VM::StartWorkers(iint numthreads) {
     if (is_worker) Error("workers can\'t start more worker threads");
     if (tuple_space) Error("workers already running");
     // Stop bad values from locking up the machine :)
-    numthreads = std::min(numthreads, 256_L);
+    numthreads = std::min(numthreads, 256_L64);
     tuple_space = new TupleSpace(bcf->udts()->size());
     for (iint i = 0; i < numthreads; i++) {
         // Create a new VM that should own all its own memory and be completely independent

@@ -25,7 +25,6 @@ using namespace lobster;
 
 Primitive polymode = PRIM_FAN;
 Shader *currentshader = NULL;
-Shader *colorshader = NULL;
 float3 lasthitsize = float3_0;
 float3 lastframehitsize = float3_0;
 bool graphics_initialized = false;
@@ -57,7 +56,6 @@ void GraphicsShutDown() {
     extern void IMGUICleanup(); IMGUICleanup();
     ShaderShutDown();
     currentshader = NULL;
-    colorshader = NULL;
     OpenGLCleanup();
     SDLSoundClose();
     SDLShutdown();
@@ -69,6 +67,12 @@ void GraphicsShutDown() {
     #endif
 }
 
+void ResetShader() {
+    auto colorshader = LookupShader("color");
+    assert(colorshader);
+    currentshader = colorshader;
+}
+
 bool GraphicsFrameStart() {
     extern void CullFonts(); CullFonts();
     extern void SteamUpdate(); SteamUpdate();
@@ -78,7 +82,7 @@ bool GraphicsFrameStart() {
     lasthitsize = float3_0;
     OpenGLFrameStart(GetScreenSize());
     Set2DMode(GetScreenSize(), true);
-    currentshader = colorshader;
+    ResetShader();
     return cb;
 }
 
@@ -142,7 +146,7 @@ Value SetUniform(VM &vm, const Value &name, const int *data, int len) {
 
 void AddGraphics(NativeRegistry &nfr) {
 
-nfr("gl_window", "title,xs,ys,flags,samples", "SIII?I?", "S?",
+nfr("gl_window", "title,xs,ys,flags,samples", "SIII?I?:1", "S?",
     "opens a window for OpenGL rendering. returns error string if any problems, nil"
     " otherwise. For flags, see modules/gl.lobster",
     [](StackPtr &, VM &vm, Value &title, Value &xs, Value &ys, Value &flags, Value &samples) {
@@ -157,9 +161,7 @@ nfr("gl_window", "title,xs,ys,flags,samples", "SIII?I?", "S?",
             LOG_INFO(err);
             return Value(vm.NewString(err));
         }
-        colorshader = LookupShader("color");
-        assert(colorshader);
-        currentshader = colorshader;
+        ResetShader();
         LOG_INFO("graphics fully initialized...");
         graphics_initialized = true;
         atexit(GraphicsShutDown);
@@ -182,6 +184,7 @@ nfr("gl_load_materials", "materialdefs,inline", "SI?", "S?",
         TestGL(vm);
         auto err = isinline.True() ? ParseMaterialFile(fn.sval()->strv())
                                    : LoadMaterialFile(fn.sval()->strv());
+        ResetShader();
         return err[0] ? Value(vm.NewString(err)) : NilVal();
     });
 
@@ -645,12 +648,10 @@ nfr("gl_perspective", "fovy,znear,zfar,frame_buffer_size,frame_buffer_offset", "
     " 60), far plane (furthest you want to be able to render, try 1000) and near plane (try"
     " 1). Optionally specify a framebuffer size to override the current gl_framebuffer_size",
     [](StackPtr &sp, VM &) {
-        int2 fbo = Top(sp).True()
-            ? PopVec<int2>(sp)
-            : (Pop(sp), int2_0);
-        int2 fbs = Top(sp).True()
-            ? PopVec<int2>(sp)
-            : (Pop(sp), GetFrameBufferSize(GetScreenSize()) - fbo);
+        int2 fbo = PopVec<int2>(sp);
+        int2 fbs = PopVec<int2>(sp);
+        if (fbs.x + fbs.y == 0)
+            fbs = GetFrameBufferSize(GetScreenSize()) - fbo;
         auto zfar = Pop(sp).fltval();
         auto znear = Pop(sp).fltval();
         auto fovy = Pop(sp).fltval();

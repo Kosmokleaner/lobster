@@ -192,7 +192,7 @@ VM_INLINE void U_RETURNNONLOCAL(VM &vm, StackPtr, int nrv, int df) {
 VM_INLINE void U_RETURNANY(VM &, StackPtr, int /*nretslots_norm*/) {
 }
 
-VM_INLINE void U_SAVERETS(VM &, StackPtr) {
+VM_INLINE void U_GOTOFUNEXIT(VM &, StackPtr) {
 }
 
 VM_INLINE void U_STATEMENT(VM &vm, StackPtr, int line, int fileidx) {
@@ -288,8 +288,6 @@ BCALLOP(6, auto a5 = Pop(sp);auto a4 = Pop(sp);auto a3 = Pop(sp);auto a2 = Pop(s
 BCALLOP(7, auto a6 = Pop(sp);auto a5 = Pop(sp);auto a4 = Pop(sp);auto a3 = Pop(sp);auto a2 = Pop(sp);auto a1 = Pop(sp);auto a0 = Pop(sp), (sp, vm, a0, a1, a2, a3, a4, a5, a6));
 
 VM_INLINE void U_ASSERTR(VM &vm, StackPtr sp, int line, int fileidx, int stringidx) {
-    (void)line;
-    (void)fileidx;
     if (Top(sp).False()) {
         vm.last_line = line;
         vm.last_fileidx = fileidx;
@@ -374,6 +372,19 @@ static_assert(std::numeric_limits<double>::is_iec559, "IEEE754 floats required")
         a = res; \
     } \
 }
+#define _SOPV(op, extras, V_T, field, geta) { \
+    PopN(sp, len); \
+    auto vecb = TopPtr(sp); \
+    auto a = geta; \
+    VMTYPEEQ(a, V_T) \
+    for (int j = 0; j < len; j++) { \
+        auto &b = vecb[j]; \
+        VMTYPEEQ(b, V_T) \
+        auto av = a.field(); \
+        TYPEOP(op, extras, av, b.field()) \
+        Push(sp, res); \
+    } \
+}
 #define _VOPV(op, extras, V_T, field, geta) { \
     PopN(sp, len); \
     auto vecb = TopPtr(sp); \
@@ -402,8 +413,10 @@ static_assert(std::numeric_limits<double>::is_iec559, "IEEE754 floats required")
 
 #define _IVOPS(op, extras, geta) _VOPS(op, extras, V_INT,   ival, geta)
 #define _IVOPV(op, extras, geta) _VOPV(op, extras, V_INT,   ival, geta)
+#define _SOPIV(op, extras, geta) _SOPV(op, extras, V_INT,   ival, geta)
 #define _FVOPS(op, extras, geta) _VOPS(op, extras, V_FLOAT, fval, geta)
 #define _FVOPV(op, extras, geta) _VOPV(op, extras, V_FLOAT, fval, geta)
+#define _SOPFV(op, extras, geta) _SOPV(op, extras, V_FLOAT, fval, geta)
 
 #define _SCAT() Value res = vm.NewString(a.sval()->strv(), b.sval()->strv())
 
@@ -416,6 +429,8 @@ static_assert(std::numeric_limits<double>::is_iec559, "IEEE754 floats required")
 #define FVVOP(op, extras) { _FVOPV(op, extras, TopPtr(sp) - len); }
 #define IVSOP(op, extras) { _IVOPS(op, extras, TopPtr(sp) - len); }
 #define FVSOP(op, extras) { _FVOPS(op, extras, TopPtr(sp) - len); }
+#define SIVOP(op, extras) { _SOPIV(op, extras, Pop(sp)); }
+#define SFVOP(op, extras) { _SOPFV(op, extras, Pop(sp)); }
 
 #define SOP(op) { GETARGS(); Value res = *a.sval() op *b.sval(); Push(sp, res); }
 #define SCAT()  { GETARGS(); _SCAT();                            Push(sp, res); }
@@ -473,6 +488,25 @@ VM_INLINE void U_FVSLT(VM &vm, StackPtr sp, int len)  { FVSOP(<,  0); }
 VM_INLINE void U_FVSGT(VM &vm, StackPtr sp, int len)  { FVSOP(>,  0); }
 VM_INLINE void U_FVSLE(VM &vm, StackPtr sp, int len)  { FVSOP(<=, 0); }
 VM_INLINE void U_FVSGE(VM &vm, StackPtr sp, int len)  { FVSOP(>=, 0); }
+
+VM_INLINE void U_SIVADD(VM &vm, StackPtr sp, int len) { SIVOP(+,  0); }
+VM_INLINE void U_SIVSUB(VM &vm, StackPtr sp, int len) { SIVOP(-,  0); }
+VM_INLINE void U_SIVMUL(VM &vm, StackPtr sp, int len) { SIVOP(*,  0); }
+VM_INLINE void U_SIVDIV(VM &vm, StackPtr sp, int len) { SIVOP(/,  1); }
+VM_INLINE void U_SIVMOD(VM &vm, StackPtr sp, int len) { SIVOP(% , 1); }
+VM_INLINE void U_SIVLT(VM &vm, StackPtr sp, int len)  { SIVOP(<,  0); }
+VM_INLINE void U_SIVGT(VM &vm, StackPtr sp, int len)  { SIVOP(>,  0); }
+VM_INLINE void U_SIVLE(VM &vm, StackPtr sp, int len)  { SIVOP(<=, 0); }
+VM_INLINE void U_SIVGE(VM &vm, StackPtr sp, int len)  { SIVOP(>=, 0); }
+VM_INLINE void U_SFVADD(VM &vm, StackPtr sp, int len) { SFVOP(+,  0); }
+VM_INLINE void U_SFVSUB(VM &vm, StackPtr sp, int len) { SFVOP(-,  0); }
+VM_INLINE void U_SFVMUL(VM &vm, StackPtr sp, int len) { SFVOP(*,  0); }
+VM_INLINE void U_SFVDIV(VM &vm, StackPtr sp, int len) { SFVOP(/,  0); }
+VM_INLINE void U_SFVMOD(VM &vm, StackPtr sp, int len) { SFVOP(/ , 2); }
+VM_INLINE void U_SFVLT(VM &vm, StackPtr sp, int len)  { SFVOP(<,  0); }
+VM_INLINE void U_SFVGT(VM &vm, StackPtr sp, int len)  { SFVOP(>,  0); }
+VM_INLINE void U_SFVLE(VM &vm, StackPtr sp, int len)  { SFVOP(<=, 0); }
+VM_INLINE void U_SFVGE(VM &vm, StackPtr sp, int len)  { SFVOP(>=, 0); }
 
 VM_INLINE void U_AEQ(VM &, StackPtr sp)  { ACOMPEN(==); }
 VM_INLINE void U_ANE(VM &, StackPtr sp)  { ACOMPEN(!=); }

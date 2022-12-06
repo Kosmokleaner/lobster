@@ -56,9 +56,9 @@ struct Parser {
         auto sf = st.FunctionScopeStart();
         st.toplevel = sf;
         auto &f = st.CreateFunction("__top_level_expression");
-        f.overloads.emplace_back(Overload {});
-        auto &ov = f.overloads[0];
-        sf->SetParent(f, ov.sf);
+        f.overloads.emplace_back(new Overload {});
+        auto &ov = *f.overloads[0];
+        sf->SetParent(f, ov);
         f.anonymous = true;
         lex.Include("stdtype.lobster", false);
         ov.gbody = new Block(lex);
@@ -403,7 +403,9 @@ struct Parser {
                 for (auto &fld : sup->fields) {
                     udt->fields.push_back(fld);
                 }
+                st.bound_typevars_stack.push_back(&udt->generics);
                 parse_specializers();
+                st.bound_typevars_stack.pop_back();
                 if (udt->FullyBound()) {
                     for (auto &g : udt->generics) {
                         udt->superclass.giventype.utr->spec_udt->specializers.push_back(&*g.giventype.utr);
@@ -606,8 +608,8 @@ struct Parser {
             }
         }
         // Create the overload.
-        f.overloads.emplace_back(Overload {});
-        sf->SetParent(f, f.overloads.back().sf);
+        f.overloads.emplace_back(new Overload {});
+        sf->SetParent(f, *f.overloads.back());
         // Check if there's any overlap in default argument ranges.
         auto ff = st.GetFirstFunction(f.name);
         while (ff) {
@@ -664,9 +666,10 @@ struct Parser {
         Line line = lex;
         if (!f.istype) {
             auto block = new Block(lex);
-            f.overloads.back().gbody = block;
+            auto &ov = *f.overloads.back();
+            ov.gbody = block;
             ParseBody(block, -1);
-            ImplicitReturn(f.overloads.back());
+            ImplicitReturn(ov);
         }
         if (name) functionstack.pop_back();
         if (non_inline_method) st.bound_typevars_stack.pop_back();
@@ -687,6 +690,17 @@ struct Parser {
         for (auto [i, type] : enumerate(types))
             dest.utr->Set(i, &*type, IsRefNil(type->t) ? lt : LT_ANY);
         return dest;
+    }
+
+    TypeRef FindTypeVar(string_view name) {
+        for (auto gv : reverse(st.bound_typevars_stack)) {
+            for (auto &btv : *gv) {
+                if (btv.tv->name == name) {
+                    return &btv.tv->thistype;
+                }
+            }
+        }
+        return nullptr;
     }
 
     UnresolvedTypeRef ParseType(bool withtype, SubFunction *sfreturntype = nullptr) {
@@ -711,7 +725,7 @@ struct Parser {
             case T_IDENT: {
                 auto f = st.FindFunction(lex.sattr);
                 if (f && f->istype) {
-                    dest = &f->overloads[0].sf->thistype;
+                    dest = &f->overloads[0]->sf->thistype;
                     lex.Next();
                     break;
                 }
@@ -721,14 +735,10 @@ struct Parser {
                     lex.Next();
                     break;
                 }
-                for (auto gv : reverse(st.bound_typevars_stack)) {
-                    for (auto &btv : *gv) {
-                        if (btv.tv->name == lex.sattr) {
-                            lex.Next();
-                            dest = &btv.tv->thistype;
-                            goto done;
-                        }
-                    }
+                dest = FindTypeVar(lex.sattr);
+                if (!dest.Null()) {
+                    lex.Next();
+                    goto done;
                 }
                 dest = &st.StructUse(lex.sattr, lex).unspecialized_type;
                 lex.Next();
@@ -816,11 +826,11 @@ struct Parser {
                         Error("function ", Q(lastid),
                               " must have single implementation to be used with ",
                               Q("return from"));
-                    sf = f->overloads[0].sf;
+                    sf = f->overloads[0]->sf;
                 }
             } else {
                 if (functionstack.size())
-                    sf = functionstack.back()->overloads.back().sf;
+                    sf = functionstack.back()->overloads.back()->sf;
             }
             return new Return(lex, rv, sf, false);
         } else if (IsNext(T_BREAK)) {
@@ -920,11 +930,14 @@ struct Parser {
     Node *ParseUnary() {
         switch (lex.token) {
             case T_MINUS: return new UnaryMinus(lex, UnaryArg());
-            case T_NOT:   return new Not(lex, UnaryArg());
             case T_NEG:   return new Negate(lex, UnaryArg());
             case T_INCR:  return new PreIncr(lex, UnaryArg());
             case T_DECR:  return new PreDecr(lex, UnaryArg());
-            default:      return ParseDeref();
+            case T_NOT:  // Different precedence.
+                lex.Next();
+                return new Not(lex, ParseOpExp(5));
+            default:
+                return ParseDeref();
         }
     }
 
@@ -1331,9 +1344,14 @@ struct Parser {
             lex.Undo(T_IDENT, idname);
             type = ParseType(false);
         } else if (lex.token == T_LEFTCURLY) {
-            udt = &st.StructUse(idname, lex);
-            type = { st.NewSpecUDT(udt) };
-            type.utr->spec_udt->is_generic = udt->is_generic;
+            auto tv = FindTypeVar(idname);
+            if (!tv.Null()) {
+                type = { tv };
+            } else {
+                udt = &st.StructUse(idname, lex);
+                type = { st.NewSpecUDT(udt) };
+                type.utr->spec_udt->is_generic = udt->is_generic;
+            }
         } else {
             udt = nullptr;
         }
@@ -1380,6 +1398,21 @@ struct Parser {
                 constructor->Add(exps[i]);
             }
             return constructor;
+        }
+        if (!type.utr.Null()) {
+            Expect(T_LEFTCURLY);
+            if (type.utr->t == V_TYPEVAR) {
+                auto constructor = new Constructor(lex, type);
+                // We don't know what args this type has, so parse any number of them, without tags.
+                while (lex.token != T_RIGHTCURLY) {
+                    constructor->Add(ParseExp());
+                    if (lex.token != T_RIGHTCURLY) Expect(T_COMMA);
+                }
+                lex.Next();
+                return constructor;
+            } else {
+                Error("type ", Q(TypeName(type.utr)), " does not have a {} constructor");
+            }
         }
         // If we see "f(" the "(" is the start of an argument list, but for "f (", "(" is
         // part of an expression of a single argument with no extra "()".
@@ -1510,8 +1543,8 @@ struct Parser {
     string DumpAll(bool onlytypechecked = false) {
         string s;
         for (auto f : st.functiontable) {
-            for (auto &ov : f->overloads) {
-                auto sf = ov.sf;
+            for (auto ov : f->overloads) {
+                auto sf = ov->sf;
                 assert(!sf->next);
                 if (!onlytypechecked || sf->typechecked) {
                     s += "FUNCTION: " + f->name + "(";
@@ -1521,7 +1554,7 @@ struct Parser {
                     s += ") -> ";
                     s += TypeName(sf->returntype);
                     s += "\n";
-                    if (ov.gbody) s += DumpNode(*ov.gbody, 4, false);
+                    if (ov->gbody) s += DumpNode(*ov->gbody, 4, false);
                     s += "\n\n";
                 }
             }

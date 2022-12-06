@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 2.8)
 
+if(NOT UNIX) 
+  message(FATAL_ERROR "Cmake configuration is only supported for Linux. For "
+  "other platforms, use the included native projects instead.")
+endif()
+
 project(Lobster)
 
 option(LOBSTER_ENGINE "Build a Lobster with the default engine included" ON)
@@ -150,14 +155,7 @@ include_directories(include
                     external/SDLMixer
                     external/freetype/include
                     external/imgui
-                    # include only for QUOTE includes: external/libtcc
-                    )
-# include only for QUOTE includes:
-if (CMAKE_GENERATOR MATCHES "Visual Studio")
-  include_directories(external/libtcc) # unless Visual Studio
-else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -iquote external/libtcc")
-endif()
+                    external/libtcc)
 
 if(LOBSTER_ENGINE)
   find_package(OpenGL REQUIRED)

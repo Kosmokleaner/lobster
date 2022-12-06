@@ -1,13 +1,6 @@
-- trafficsim.lobster(120): error: can't find specialized superclass for `node`
-
-- `sum` and some other std functions run into the int/float constant warning.
-
 - debugger todo
   - "d" in sample without value?
   - doesn't show some global constants inited?
-  - tables column widths: https://github.com/ocornut/imgui/issues/5478
-  - Show file/line for exact current position.
-  - Always unfold first stackframe?
   - Mark all stack-frames up to breakpoint (and maybe assert) as no-inline, then increase limits for all other functions?
   - Add custom view for textures, or any resource types..
   - Add a small source code view, will help quickly spotting the problem.
@@ -18,8 +11,6 @@
   - A debugging mode where a breakpoint can be set when the programming is already running?
     Would be expensive to have a breakpoint check between every statement..
     But this would enable traditional step by step debugging.
-
-- `remove` shows a default value of `0` in the docs, could add integer defaults to the type string.
 
 - continue vmcore experiment.
 
@@ -33,6 +24,12 @@
   - That's going to create 100+ issues, and not necessarily easier to overview since github doesn't have a good way to
     order issues by priority, and search for things.
   - Right now, searches for keywords hit both code and this TODO.txt.
+
+- move to more of a many-passes architecture to facility cleaning up further messes,
+  in particular resolving generic types, and maybe some of the function checking.
+  Could start by having a number of passes between parser and type-checker, and
+  systematically pull steps from the typechecker into that, with the objective
+  that the final typechecker pass only works on concrete fully specialized types.
 
 - move function checking into typechecker.
   This is now mostly done.
@@ -116,6 +113,9 @@
       - SharedField can be removed, only needed in deciding how to parse x.y and x.y(
     - If we're NOT going to do the above, then some more uses of new GenericCall can
       already be made to specific calls in the parser.
+
+- There's likely all sorts of uses of SubFunction that would be less buggy if Overload was used instead.
+  - To find out, have to audit every use of it.
 
 - error on `if a:` where `a` is non-nillable ref type?
   - same for `assert a`.
@@ -236,6 +236,9 @@
 
 - Fix FIXME in Break::Generate
 
+- `sum` and some other std functions have `let init = 0` to work around the int/float constant warning.
+  Can we do something better here?
+
 - One not so nice thing about `::` to create a type scope is that it forces you to declare the type, e.g.
   hof() x: ..       // don't have to declare type of X, derived from `hof` arg.
   hof() (x::X): ..  // Must declare type.
@@ -335,6 +338,9 @@
 
   Also would be nice to have a good hash-map as part of the language, to compliment the
   simplistic binary_search.
+  If we do, would be nice to use a technique like https://github.com/martinus/unordered_dense
+  and have it be based on the existing vector type (either as "subtype" or it owns a vector),
+  that way all the vector ops we have can be reused as-is.
   Could cheap-out and add one as a resource, but that would make retrieved values have no
   type.
   Maybe allow resources to have a type parameter?
@@ -747,6 +753,8 @@
       always-64-bit values, limiting the amount of cleanup you can do.
       There is some of this (see iint and ssize_t in tools.h), but converting more code
       only makes sense once we can drop 32-bit platforms entirely.
+      See when all compilers support this to experiment with it?
+      https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1227r2.html
     - change bytecode from int to LEB. this will make it more compact, though mildly slower
       to read. would solve issues with 64-bit contants etc. would read into iint or int64_t,
       depending. Can still hard-code instruction into 16-bit. Or make it a 16-bit LEB?
@@ -783,8 +791,11 @@
 - We support implicit this.member in multi-assign, but not explicit.
   See mretfields test.
 
-- should support scalar op vector, not just vector op scalar
-  - that requires yet more vector vm ops, at least for - /
+- we should support e.g.
+    import vec
+    struct mat2x2<T> : xyzw<T>
+    struct mat2x2_f = mat2x2<float>
+    print mat2x2_f { 1.0,  1.0,  1.0,  1.0 } - mat2x2_f { 2.0,  2.0,  2.0,  2.0 }
 
 - Do special purpose codegen for sequences of string concat with I2S etc.
   See GenConcatOp.
@@ -838,6 +849,18 @@
     nice to separate out the default const string from niche mutable use). We also have const/var
     variables. We were also thinking about mut argument annotations which would still also be nice
     being able to say an arg is mut without specifying the type.
+  - Code like this complains about a being modified while borrowed:
+        import imgui
+        class A:
+            s = "hi"
+        var a = A {}
+        im_treenode(a.s):
+            a = A {}
+    This could be avoided if im_treenode was forced to be specialized with own instead of borrow,
+    but to know this, we'd somehow need to know its going to get assigned to.
+    That, or always use own for functions instead of specializing, which would make the whole
+    system more robust (and reduce the amount of specializations), but would probably increase
+    the amount of runtime refc a lot.. something to be measured.
 
 - add to imgui functionality:
   - logging

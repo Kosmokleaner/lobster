@@ -173,7 +173,7 @@ uint8_t FindClosestNormal(float3 normal) {
 const size_t palette_size = 256 * sizeof(byte4);
 
 size_t NewPalette(const byte4 *p) {
-    auto hash = FNV1A64(string_view((const char *)&p, palette_size));
+    auto hash = FNV1A64(string_view((const char *)p, palette_size));
     // See if there's an existing matching palette.
     for (auto [pali, pal] : enumerate(palettes)) {
         if (pal.hash == hash &&  // Quick reject.
@@ -563,13 +563,13 @@ nfr("cg_load_vox", "name", "S", "R:voxels]S?",
         auto errf = [&](string_view err) {
             // TODO: could clear voxvec elements if any?
             Push(sp, Value(voxvec));
-            return Value(vm.NewString(err));
+            return Value(vm.NewString(cat(namep, ": ", err)));
         };
         auto erreof = [&]() {
-            return errf("Unexpected end of vox file.");
+            return errf("unexpected end of .vox file.");
         };
         auto l = LoadFile(namep, &buf);
-        if (l < 0) return errf(cat("could not load ", namep));
+        if (l < 0) return errf("could not load");
         auto bufs = gsl::span<const uint8_t>((const uint8_t *)buf.c_str(), buf.size());
         if ((bufs.size() >= 8) && (strncmp((const char *)bufs.data(), "VOX ", 4) == 0)) {
             // This looks like a MagicaVoxel file.
@@ -654,6 +654,7 @@ nfr("cg_load_vox", "name", "S", "R:voxels]S?",
 
                     int32_t num_frames;
                     if (!ReadSpanInc(p, num_frames)) return erreof();
+                    if (num_frames != 1) return errf(cat(".vox file uses an object with multiple frames, which is not supported: ", num_frames));
                     int3 offset = int3_0;
                     for (int frame = 0; frame < num_frames; ++frame) {
                         int32_t dict_len;
@@ -663,14 +664,21 @@ nfr("cg_load_vox", "name", "S", "R:voxels]S?",
                             if (!ReadSpanVec<string, int32_t>(p, key)) return erreof();
                             if (!ReadSpanVec<string, int32_t>(p, value)) return erreof();
                             if (key == "_t") {
-                                const char* cursor = value.c_str();
-                                char* next;
+                                const char *cursor = value.c_str();
+                                char *next;
                                 offset.x = std::strtol(cursor, &next, 10);
                                 cursor = next + 1;
                                 offset.y = std::strtol(cursor, &next, 10);
                                 cursor = next + 1;
                                 offset.z = std::strtol(cursor, &next, 10);
                                 node_offset.insert_or_assign(node_id, offset);
+                            }
+                            if (key == "_r") {
+                                const char *cursor = value.c_str();
+                                char *next;
+                                auto rotation = std::strtol(cursor, &next, 10);
+                                // 4 is the noop rotation
+                                if (rotation != 4) return errf(cat(".vox file uses an object rotation or flip that is not supported: ", value));
                             }
                         }
                     }
@@ -713,6 +721,7 @@ nfr("cg_load_vox", "name", "S", "R:voxels]S?",
                     }
                     int32_t models_num;
                     if (!ReadSpanInc(p, models_num)) return erreof();
+                    if (models_num != 1) return errf(cat(".vox file uses an object with multiple models, which is not supported: ", models_num));
                     for (int i = 0; i < models_num; ++i) {
                         int32_t model_id;
                         if (ReadSpanInc(p, model_id))
@@ -744,6 +753,9 @@ nfr("cg_load_vox", "name", "S", "R:voxels]S?",
                     chunks_skipped = true;
                 }
             }
+            if (voxvec->SLen() < (ssize_t)node_to_model.size()) {
+                return errf(".vox file uses object deduplication feature that is not supported\n");
+            }
             for (auto &i : node_to_layer)
                 if ((layer_names.find(i.second) != layer_names.end()) && (node_names.find(i.first) == node_names.end()))
                     node_names.insert_or_assign(i.first, layer_names[i.second]);
@@ -752,8 +764,7 @@ nfr("cg_load_vox", "name", "S", "R:voxels]S?",
                 auto model_id = i.second;
                 for (;;) {
                     if (node_offset.find(node_id) != node_offset.end()) {
-                        GetVoxels(voxvec->At(model_id)).offset = node_offset[node_id];
-                        break;
+                        GetVoxels(voxvec->At(model_id)).offset += node_offset[node_id];
                     }
                     if (node_graph.find(node_id) == node_graph.end())
                         break;
@@ -829,7 +840,7 @@ nfr("cg_save_vox", "block,name", "R:voxelsS", "B",
                 }
             }
         }
-        FILE *f = OpenForWriting(name.sval()->strv(), true);
+        FILE *f = OpenForWriting(name.sval()->strv(), true, false);
         if (!f) return Value(false);
         auto wint = [&](int i) { fwrite(&i, 4, 1, f); };
         auto wstr = [&](const char *s) { fwrite(s, 4, 1, f); };

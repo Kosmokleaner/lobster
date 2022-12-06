@@ -31,7 +31,7 @@ typedef ptrdiff_t ssize_t;
 
 // Custom _L suffix, since neither L (different size on win/nix) or LL
 // (does not convert to int64_t on nix!) is portable.
-inline constexpr iint operator"" _L(unsigned long long int c) {
+inline constexpr iint operator"" _L64(unsigned long long int c) {
     return (iint)c;
 }
 
@@ -348,6 +348,11 @@ template<typename T> struct RandomNumberGenerator {
     int64_t rnd_int64(int64_t max) {
         static_assert(sizeof(typename T::rnd_type) == 8);
         return (int64_t)(rnd.Random() % max);
+    }
+
+    template<typename U> U rnd_i(U max) {
+        static_assert(sizeof(typename T::rnd_type) >= sizeof(U));
+        return (U)(rnd.Random() % max);
     }
 
     double rnd_double() {
@@ -1098,12 +1103,6 @@ inline void THROW_OR_ABORT(const string &s) {
     #endif
 }
 
-inline void unit_test_tools() {
-    assert(strcmp(null_terminated<0>(string_view("aa", 1)),
-                  null_terminated<1>(string_view("bb", 1))) != 0);
-    assert(cat_parens(1, 2) == "(1, 2)");
-}
-
 
 // Stack profiling.
 
@@ -1134,3 +1133,94 @@ struct StackHelper {
 #else
     #define STACK_PROFILE
 #endif
+
+
+
+
+// small_vector, similar to llvm::SmallVector, stores N elements in-line, only dynamically
+// allocated if more than that.
+// Uses memcpy on growth, so not for elements with non-trivial copy constructors.
+// It stores a pointer overlapping with the fixed elements, so there is no point to
+// make N smaller than sizeof(T *) / sizeof(T).
+
+template<typename T, int N> class small_vector {
+    // These could be 16-bit, but there's no easy portable way to stop the T* below from
+    // padding the struct in that case.
+    uint32_t len = 0;
+    uint32_t cap = N;
+
+    union {
+        T elems[N];
+        T *buf;
+    };
+
+    void grow() {
+        uint32_t nc = len * 2;
+        auto b = new T[nc];
+        t_memcpy(b, data(), len);
+        if (cap > N) delete[] buf;
+        cap = nc;
+        buf = b;
+    }
+
+    public:
+
+    small_vector() {}
+
+    ~small_vector() {
+        if (cap > N) delete[] buf;
+    }
+
+    size_t size() {
+        return len;
+    }
+
+    T *data() {
+        return cap == N ? elems : buf;
+    }
+
+    bool empty() {
+        return len == 0;
+    }
+
+    T &operator[](size_t i) {
+        assert(i < len);
+        return data()[i];
+    }
+
+    T *begin() { return data(); }
+    T *end() { return data() + len; }
+
+    T &back() {
+        assert(len);
+        return data()[len - 1];
+    }
+
+    void push_back(const T &e) {
+        if (len == cap) grow();
+        data()[len++] = e;
+    }
+
+    void insert(size_t at, const T &e) {
+        assert(at <= len);
+        if (len == cap) grow();
+        if (at != len) t_memmove(data() + at + 1, data() + at, size() - at);
+        data()[at] = e;
+        len++;
+    }
+
+    void erase(size_t at) {
+        assert(at < len);
+        if (at != len - 1) t_memmove(data() + at, data() + at + 1, size() - at - 1);
+        len--;
+    }
+};
+
+
+
+inline void unit_test_tools() {
+    assert(strcmp(null_terminated<0>(string_view("aa", 1)),
+                  null_terminated<1>(string_view("bb", 1))) != 0);
+    assert(cat_parens(1, 2) == "(1, 2)");
+    assert(sizeof(small_vector<int, 2>) == 16);
+}
